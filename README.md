@@ -17,6 +17,7 @@ The repo is built to stay adaptable when hardware, ROCm, or metrics change:
 - Runtime profiles capture ROCm/library assumptions separately from hardware.
 - Benchmarks and metrics are both registry-driven, so new modules can be added without editing the runner.
 - Native HIP/C++ kernels can be compiled on demand for HBM and MFU paths, or swapped for your own executable.
+- Profiling engines can wrap a suite run and attach external artifacts such as `rocprof` traces.
 - Dtype support is discovered dynamically from the installed `torch` build, including optional float8 types when present.
 
 ## Repo Layout
@@ -127,6 +128,31 @@ For integer and complex dtypes, the repo uses dtype-specific operation-count fac
 
 Some dtype and benchmark combinations are not valid on every ROCm stack. Those cases are recorded as `skipped` with an error message instead of aborting the whole suite.
 
+## Profiling
+
+Suites can optionally run under a profiling engine. Built-in support includes:
+
+- `rocprof`
+
+Example:
+
+```yaml
+profiling:
+  enabled: true
+  engine: rocprof
+  params:
+    stats: true
+    hip_trace: true
+```
+
+When profiling is enabled, TeamRedBench launches an internal child run under the selected profiler, then attaches the profiling artifact directory to the normal metadata output. The profile artifact path is also added as `profiling` in the output map inside the `*.metadata.json` file.
+
+List registered profiling engines:
+
+```bash
+teamredbench list-profile-engines
+```
+
 ## Adapting to New Hardware
 
 Hardware-specific numbers are isolated in YAML:
@@ -219,6 +245,10 @@ benchmarks:
 
 `teamredbench list-native-kernels` shows the registered native kernels.
 
+## rocprof Example
+
+See `configs/suites/rocprof_hbm_smoke.yaml` for a minimal HBM run wrapped by `rocprof`.
+
 ## Example Commands
 
 List built-ins:
@@ -227,7 +257,14 @@ List built-ins:
 teamredbench list-benchmarks
 teamredbench list-metrics
 teamredbench list-native-kernels
+teamredbench list-profile-engines
 teamredbench list-dtypes
+```
+
+Run the example rocprof suite:
+
+```bash
+teamredbench run configs/suites/rocprof_hbm_smoke.yaml
 ```
 
 Run the full suite:

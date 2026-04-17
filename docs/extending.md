@@ -173,3 +173,65 @@ Runtime contract for custom executables:
 ```
 
 Use `status: "skipped"` with an `error` field when a dtype or mode is intentionally unsupported.
+
+## Profiling Engines
+
+Suites can declare a top-level profiling engine:
+
+```yaml
+profiling:
+  enabled: true
+  engine: rocprof
+  params:
+    stats: true
+    hip_trace: true
+```
+
+Built-in profiling engines are registered at import time. You can add your own from a plugin:
+
+```python
+from teamredbench.profiling.registry import ProfilingLaunch, register_profile_engine
+
+def build_command(params, target_command, artifact_dir, base_dir):
+    return ProfilingLaunch(
+        command=("my-profiler", *target_command),
+        artifact_dir=artifact_dir,
+        metadata={"engine": "my-profiler"},
+    )
+
+register_profile_engine(
+    name="my-profiler",
+    description="Example external profiler.",
+    build_command=build_command,
+)
+```
+
+`target_command` is the internal TeamRedBench run command that your profiler should wrap. `artifact_dir` is the directory reserved for profiler outputs. TeamRedBench records that directory in the final metadata file.
+
+Built-in `rocprof` parameters currently supported through `profiling.params`:
+
+- `binary`
+- `tool_version`
+- `input`
+- `metric_file`
+- `output`
+- `data_dir`
+- `temporary_dir`
+- `stats`
+- `roctx_trace`
+- `hip_trace`
+- `hsa_trace`
+- `sys_trace`
+- `roctx_rename`
+- `parallel_kernels`
+- `cmd_qts`
+- `basenames`
+- `timestamp`
+- `ctx_wait`
+- `obj_tracking`
+- `trace_start`
+- `ctx_limit`
+- `heartbeat`
+- `trace_period`
+- `flush_rate`
+- `extra_args`

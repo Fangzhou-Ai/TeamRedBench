@@ -1,0 +1,30 @@
+name: rocprof-hbm-smoke
+device:
+  profile: ../profiles/hardware/cdna_generic.yaml
+runtime:
+  profile: ../profiles/rocm/rocm_generic.yaml
+plugins: []
+profiling:
+  enabled: true
+  engine: rocprof
+  params:
+    stats: true
+    hip_trace: true
+outputs:
+  directory: ../../results/rocprof_hbm_smoke
+  formats:
+    - json
+    - csv
+benchmarks:
+  - benchmark: hbm
+    params:
+      backend: native
+      dtypes:
+        - float32
+      modes:
+        - copy
+      size_mib: 256
+      warmup: 2
+      iterations: 5
+      native:
+        kernel: hbm_hip

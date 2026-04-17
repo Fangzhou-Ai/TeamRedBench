@@ -252,6 +252,7 @@ def build_run_metadata(
     context: BenchmarkContext,
     requested_device_id: int,
     output_dir: Path,
+    output_formats: list[str],
     profile_note: str | None,
     started_at: datetime,
     finished_at: datetime,
@@ -298,7 +299,8 @@ def build_run_metadata(
             "hardware_profile": _config_metadata(context.hardware_profile.path, context.hardware_profile.raw),
             "runtime_profile": _config_metadata(context.runtime_profile.path, context.runtime_profile.raw),
             "profile_note": profile_note,
+            "profiling": dict(suite.profiling.raw),
             "plugins": list(suite.plugins),
-            "output_formats": list(suite.outputs.formats),
+            "output_formats": list(output_formats),
         },
     }

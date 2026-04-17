@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,8 @@ from teamredbench.device import discover_environment, load_torch
 from teamredbench.dtypes import discover_dtypes
 from teamredbench.native.registry import list_native_kernels
 from teamredbench.native.runtime import clear_native_cache, native_cache_dir
+from teamredbench.profiling.registry import list_profile_engines
+from teamredbench.profiling.runtime import profiling_active
 from teamredbench.registry import list_benchmarks, list_metrics
 from teamredbench.runner import run_suite
 
@@ -92,6 +95,8 @@ def run(
         device_id=device_id,
         record_callback=(lambda record: typer.echo(_format_record(record))) if print_records else None,
     )
+    if profiling_active() or os.environ.get("TEAMREDBENCH_SUPPRESS_CLI_OUTPUT") == "1":
+        return
     typer.echo(f"Suite: {summary.suite.name}")
     typer.echo(f"Hardware Profile: {summary.context.hardware_profile.name}")
     if summary.profile_note:
@@ -120,6 +125,12 @@ def list_native_kernels_command(
 ) -> None:
     for definition in list_native_kernels(benchmark=benchmark):
         typer.echo(f"{definition.name} [{definition.benchmark}]")
+
+
+@app.command("list-profile-engines")
+def list_profile_engines_command() -> None:
+    for definition in list_profile_engines():
+        typer.echo(f"{definition.name}: {definition.description}")
 
 
 @app.command("list-dtypes")
