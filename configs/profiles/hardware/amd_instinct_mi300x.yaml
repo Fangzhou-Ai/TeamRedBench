@@ -1,0 +1,42 @@
+name: amd-instinct-mi300x
+family: cdna3
+peak_hbm_bandwidth_gbps: 5325.0
+peak_link_bandwidth_gbps:
+  xgmi: 896.0
+  network: null
+  total_io: 1024.0
+  host_pcie: 128.0
+  per_link: 128.0
+peak_compute_tops:
+  float8_e4m3fn: 2614.9
+  float8_e5m2: 2614.9
+  float16: 1307.4
+  bfloat16: 1307.4
+  float32: 163.4
+  float64: 163.4
+  int8: 2614.9
+published_dense_compute_tops:
+  fp64_vector: 81.7
+  fp64_matrix: 163.4
+  fp32_vector: 163.4
+  fp32_matrix: 163.4
+  tf32_matrix: 653.7
+  float16_matrix: 1307.4
+  bfloat16_matrix: 1307.4
+  float8_matrix: 2614.9
+  int8_matrix: 2614.9
+published_sparse_compute_tops:
+  tf32_matrix: 1307.4
+  float16_matrix: 2614.9
+  bfloat16_matrix: 2614.9
+  float8_matrix: 5229.8
+  int8_matrix: 5229.8
+source_urls:
+  - https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html
+  - https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/data-sheets/amd-instinct-mi300x-data-sheet.pdf
+  - https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/white-papers/amd-cdna-3-white-paper.pdf
+notes:
+  - peak_compute_tops uses dense matrix or tensor peaks so GEMM-based MFU compares against the relevant published limit.
+  - peak_link_bandwidth_gbps.xgmi uses the published 8-GPU ring aggregate peer-to-peer bandwidth.
+  - peak_link_bandwidth_gbps.network is intentionally null because inter-node limits depend on the installed NIC and fabric.
+

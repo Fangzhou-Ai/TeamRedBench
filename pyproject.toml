@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teamredbench"
+version = "0.1.0"
+description = "Config-driven AMD RDNA/CDNA GPU benchmark suite for ROCm."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0",
+  "typer>=0.12",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.2"]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+]
+
+[project.scripts]
+teamredbench = "teamredbench.cli:app"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+

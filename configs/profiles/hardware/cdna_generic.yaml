@@ -1,0 +1,15 @@
+name: cdna-generic
+family: cdna
+peak_hbm_bandwidth_gbps: 0
+peak_link_bandwidth_gbps:
+  xgmi: 0
+  network: 0
+peak_compute_tops:
+  float16: 0
+  bfloat16: 0
+  float32: 0
+  float64: 0
+  int8: 0
+notes:
+  - Copy this file and fill in SKU-specific peak numbers before using efficiency or MFU metrics.
+

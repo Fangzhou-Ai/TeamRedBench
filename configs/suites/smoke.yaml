@@ -1,0 +1,43 @@
+name: smoke
+device:
+  profile: ../profiles/hardware/cdna_generic.yaml
+runtime:
+  profile: ../profiles/rocm/rocm_generic.yaml
+plugins: []
+outputs:
+  directory: ../../results/smoke
+  formats:
+    - json
+    - csv
+benchmarks:
+  - benchmark: hbm
+    metrics:
+      - hbm_bandwidth_gbps
+      - hbm_efficiency_pct
+      - latency_us
+    params:
+      dtypes:
+        - float16
+        - bfloat16
+        - float32
+        - int8
+      modes:
+        - copy
+      size_mib: 512
+      warmup: 5
+      iterations: 20
+  - benchmark: mfu
+    metrics:
+      - achieved_tops
+      - mfu_pct
+      - latency_us
+    params:
+      dtypes:
+        - float16
+        - bfloat16
+        - float32
+      shapes:
+        - [4096, 4096, 4096]
+      warmup: 5
+      iterations: 20
+

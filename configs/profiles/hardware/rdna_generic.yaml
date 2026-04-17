@@ -1,0 +1,15 @@
+name: rdna-generic
+family: rdna
+peak_hbm_bandwidth_gbps: 0
+peak_link_bandwidth_gbps:
+  xgmi: 0
+  network: 0
+peak_compute_tops:
+  float16: 0
+  float32: 0
+  float64: 0
+  int8: 0
+notes:
+  - Use this as a template for workstation and client GPUs.
+  - Add or remove dtype peak entries to match the exact SKU and ROCm stack.
+

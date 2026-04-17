@@ -1,0 +1,44 @@
+name: amd-instinct-mi355x
+family: cdna4
+peak_hbm_bandwidth_gbps: 8000.0
+peak_link_bandwidth_gbps:
+  xgmi: 1075.2
+  network: null
+  total_io: 1203.2
+  host_pcie: 128.0
+  per_link: 153.6
+peak_compute_tops:
+  float8_e4m3fn: 5000.0
+  float8_e5m2: 5000.0
+  float16: 2500.0
+  bfloat16: 2500.0
+  float32: 157.3
+  float64: 78.6
+  int8: 5000.0
+published_dense_compute_tops:
+  fp64_vector: 78.6
+  fp64_matrix: 78.6
+  fp32_vector: 157.3
+  fp32_matrix: 157.3
+  fp16_vector: 157.3
+  float16_matrix: 2500.0
+  bfloat16_matrix: 2500.0
+  ocp_fp8_matrix: 5000.0
+  mxfp8_matrix: 5000.0
+  mxfp6_matrix: 10100.0
+  mxfp4_matrix: 10100.0
+  int8_matrix: 5000.0
+published_sparse_compute_tops:
+  float16_matrix: 5000.0
+  bfloat16_matrix: 5000.0
+  ocp_fp8_matrix: 10100.0
+  int8_matrix: 10100.0
+source_urls:
+  - https://www.amd.com/en/products/accelerators/instinct/mi350/mi355x.html
+  - https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/white-papers/amd-cdna-4-architecture-whitepaper.pdf
+notes:
+  - peak_compute_tops uses dense matrix or tensor peaks so GEMM-based MFU compares against the relevant published limit.
+  - float8_e4m3fn and float8_e5m2 map to AMD's published dense OCP-FP8 matrix peak for MI355X.
+  - peak_link_bandwidth_gbps.xgmi uses the published 8-GPU ring aggregate peer-to-peer bandwidth.
+  - peak_link_bandwidth_gbps.network is intentionally null because inter-node limits depend on the installed NIC and fabric.
+

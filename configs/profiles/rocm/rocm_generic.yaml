@@ -1,0 +1,10 @@
+name: rocm-generic
+rocm_version: "6.x"
+libraries:
+  pytorch: "2.x"
+  rccl: system
+  hipblaslt: system
+env: {}
+notes:
+  - Keep runtime-specific assumptions here so hardware profiles stay stable.
+  - Add RCCL-specific environment overrides here only when the target stack needs them.

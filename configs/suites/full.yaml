@@ -1,0 +1,55 @@
+name: full
+device:
+  profile: ../profiles/hardware/cdna_generic.yaml
+runtime:
+  profile: ../profiles/rocm/rocm_generic.yaml
+plugins: []
+outputs:
+  directory: ../../results/full
+  formats:
+    - json
+    - csv
+benchmarks:
+  - benchmark: hbm
+    params:
+      dtypes:
+        - all
+      modes:
+        - copy
+        - scale
+        - triad
+      size_mib: 2048
+      warmup: 10
+      iterations: 50
+  - benchmark: collective
+    params:
+      dtypes:
+        - float16
+        - bfloat16
+        - float32
+        - int8
+      operations:
+        - all_reduce
+        - all_gather
+        - broadcast
+      sizes_mib:
+        - 8
+        - 64
+        - 256
+      warmup: 20
+      iterations: 100
+  - benchmark: mfu
+    params:
+      dtypes:
+        - float16
+        - bfloat16
+        - float32
+        - float64
+        - int8
+        - complex64
+      shapes:
+        - [4096, 4096, 4096]
+        - [8192, 8192, 8192]
+      warmup: 10
+      iterations: 50
+
