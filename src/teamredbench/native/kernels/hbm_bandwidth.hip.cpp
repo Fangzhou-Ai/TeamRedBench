@@ -14,8 +14,19 @@
 namespace {
 
 constexpr int kThreadsPerBlock = 256;
-constexpr int kCopyVectorUnroll = 4;
-constexpr int kComputeVectorUnroll = 2;
+constexpr int kComputeVectorUnroll = 4;
+
+// Native 16-byte vector (4x i32). Required so nontemporal load/store builtins
+// accept the pointer — HIP's int4 wrapper type is rejected by the builtin.
+using Vec16 = int __attribute__((ext_vector_type(4)));
+
+__device__ __forceinline__ Vec16 nt_load(const Vec16* __restrict__ ptr) {
+    return __builtin_nontemporal_load(ptr);
+}
+
+__device__ __forceinline__ void nt_store(Vec16 value, Vec16* __restrict__ ptr) {
+    __builtin_nontemporal_store(value, ptr);
+}
 
 struct Args {
     std::string dtype = "float32";
@@ -69,8 +80,8 @@ Args parse_args(int argc, char** argv) {
 }
 
 template <typename T>
-__device__ __forceinline__ void scale_vector(int4& raw, T alpha) {
-    constexpr std::size_t vec_width = sizeof(int4) / sizeof(T);
+__device__ __forceinline__ void scale_vector(Vec16& raw, T alpha) {
+    constexpr std::size_t vec_width = sizeof(Vec16) / sizeof(T);
     T* lane = reinterpret_cast<T*>(&raw);
     #pragma unroll
     for(std::size_t k = 0; k < vec_width; ++k) {
@@ -79,8 +90,8 @@ __device__ __forceinline__ void scale_vector(int4& raw, T alpha) {
 }
 
 template <typename T>
-__device__ __forceinline__ void triad_vector(int4& a, const int4& b, T alpha) {
-    constexpr std::size_t vec_width = sizeof(int4) / sizeof(T);
+__device__ __forceinline__ void triad_vector(Vec16& a, const Vec16& b, T alpha) {
+    constexpr std::size_t vec_width = sizeof(Vec16) / sizeof(T);
     T* a_lane = reinterpret_cast<T*>(&a);
     const T* b_lane = reinterpret_cast<const T*>(&b);
     #pragma unroll
@@ -92,12 +103,11 @@ __device__ __forceinline__ void triad_vector(int4& a, const int4& b, T alpha) {
 template <typename T>
 __global__ __launch_bounds__(256) void scale_kernel(
     const T* __restrict__ src, T* __restrict__ dst, T alpha, std::size_t count) {
-    using Vec = int4;
-    constexpr std::size_t vec_width = sizeof(Vec) / sizeof(T);
+    constexpr std::size_t vec_width = sizeof(Vec16) / sizeof(T);
 
     const std::size_t vec_count = count / vec_width;
-    const Vec* __restrict__ src_v = reinterpret_cast<const Vec*>(src);
-    Vec* __restrict__ dst_v = reinterpret_cast<Vec*>(dst);
+    const Vec16* __restrict__ src_v = reinterpret_cast<const Vec16*>(src);
+    Vec16* __restrict__ dst_v = reinterpret_cast<Vec16*>(dst);
 
     const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
@@ -107,18 +117,26 @@ __global__ __launch_bounds__(256) void scale_kernel(
         vec_count >= static_cast<std::size_t>(kComputeVectorUnroll - 1) * stride
             ? vec_count - static_cast<std::size_t>(kComputeVectorUnroll - 1) * stride
             : 0;
+    // Wide unroll + nontemporal stores: fills more loads in flight per wave and
+    // skips L2 write-allocate so bandwidth goes to the actual store stream.
     for(; index < unroll_bound; index += static_cast<std::size_t>(kComputeVectorUnroll) * stride) {
-        Vec raw0 = src_v[index];
-        Vec raw1 = src_v[index + stride];
-        scale_vector(raw0, alpha);
-        scale_vector(raw1, alpha);
-        dst_v[index] = raw0;
-        dst_v[index + stride] = raw1;
+        Vec16 r0 = src_v[index];
+        Vec16 r1 = src_v[index + stride];
+        Vec16 r2 = src_v[index + 2 * stride];
+        Vec16 r3 = src_v[index + 3 * stride];
+        scale_vector(r0, alpha);
+        scale_vector(r1, alpha);
+        scale_vector(r2, alpha);
+        scale_vector(r3, alpha);
+        nt_store(r0, dst_v + index);
+        nt_store(r1, dst_v + index + stride);
+        nt_store(r2, dst_v + index + 2 * stride);
+        nt_store(r3, dst_v + index + 3 * stride);
     }
     for(; index < vec_count; index += stride) {
-        Vec raw = src_v[index];
+        Vec16 raw = src_v[index];
         scale_vector(raw, alpha);
-        dst_v[index] = raw;
+        nt_store(raw, dst_v + index);
     }
 
     const std::size_t tail_base = vec_count * vec_width;
@@ -131,13 +149,12 @@ template <typename T>
 __global__ __launch_bounds__(256) void triad_kernel(
     const T* __restrict__ src, const T* __restrict__ aux, T* __restrict__ dst,
     T alpha, std::size_t count) {
-    using Vec = int4;
-    constexpr std::size_t vec_width = sizeof(Vec) / sizeof(T);
+    constexpr std::size_t vec_width = sizeof(Vec16) / sizeof(T);
 
     const std::size_t vec_count = count / vec_width;
-    const Vec* __restrict__ src_v = reinterpret_cast<const Vec*>(src);
-    const Vec* __restrict__ aux_v = reinterpret_cast<const Vec*>(aux);
-    Vec* __restrict__ dst_v = reinterpret_cast<Vec*>(dst);
+    const Vec16* __restrict__ src_v = reinterpret_cast<const Vec16*>(src);
+    const Vec16* __restrict__ aux_v = reinterpret_cast<const Vec16*>(aux);
+    Vec16* __restrict__ dst_v = reinterpret_cast<Vec16*>(dst);
 
     const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
@@ -148,20 +165,28 @@ __global__ __launch_bounds__(256) void triad_kernel(
             ? vec_count - static_cast<std::size_t>(kComputeVectorUnroll - 1) * stride
             : 0;
     for(; index < unroll_bound; index += static_cast<std::size_t>(kComputeVectorUnroll) * stride) {
-        Vec a0 = src_v[index];
-        Vec b0 = aux_v[index];
-        Vec a1 = src_v[index + stride];
-        Vec b1 = aux_v[index + stride];
+        Vec16 a0 = src_v[index];
+        Vec16 a1 = src_v[index + stride];
+        Vec16 a2 = src_v[index + 2 * stride];
+        Vec16 a3 = src_v[index + 3 * stride];
+        Vec16 b0 = aux_v[index];
+        Vec16 b1 = aux_v[index + stride];
+        Vec16 b2 = aux_v[index + 2 * stride];
+        Vec16 b3 = aux_v[index + 3 * stride];
         triad_vector(a0, b0, alpha);
         triad_vector(a1, b1, alpha);
-        dst_v[index] = a0;
-        dst_v[index + stride] = a1;
+        triad_vector(a2, b2, alpha);
+        triad_vector(a3, b3, alpha);
+        nt_store(a0, dst_v + index);
+        nt_store(a1, dst_v + index + stride);
+        nt_store(a2, dst_v + index + 2 * stride);
+        nt_store(a3, dst_v + index + 3 * stride);
     }
     for(; index < vec_count; index += stride) {
-        Vec a = src_v[index];
-        const Vec b = aux_v[index];
+        Vec16 a = src_v[index];
+        const Vec16 b = aux_v[index];
         triad_vector(a, b, alpha);
-        dst_v[index] = a;
+        nt_store(a, dst_v + index);
     }
 
     const std::size_t tail_base = vec_count * vec_width;
