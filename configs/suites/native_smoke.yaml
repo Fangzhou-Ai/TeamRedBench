@@ -1,0 +1,43 @@
+name: native-smoke
+device:
+  profile: ../profiles/hardware/cdna_generic.yaml
+runtime:
+  profile: ../profiles/rocm/rocm_generic.yaml
+plugins: []
+outputs:
+  directory: ../../results/native_smoke
+  formats:
+    - json
+    - csv
+benchmarks:
+  - benchmark: hbm
+    params:
+      backend: native
+      dtypes:
+        - float16
+        - bfloat16
+        - float32
+        - float64
+      modes:
+        - copy
+        - scale
+        - triad
+      size_mib: 2048
+      warmup: 5
+      iterations: 20
+      native:
+        kernel: hbm_hip
+  - benchmark: mfu
+    params:
+      backend: native
+      dtypes:
+        - float16
+        - bfloat16
+        - float32
+        - float64
+      shapes:
+        - [4096, 4096, 4096]
+      warmup: 5
+      iterations: 20
+      native:
+        kernel: mfu_hipblas

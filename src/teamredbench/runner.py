@@ -13,6 +13,7 @@ from teamredbench.config import HardwareProfile, SuiteConfig, load_hardware_prof
 from teamredbench.device import detect_device, load_torch
 from teamredbench.dtypes import discover_dtypes
 from teamredbench.io import write_results
+from teamredbench.profiling.runtime import effective_output_formats, profiling_enabled, run_profiled_suite
 from teamredbench.provenance import build_run_metadata
 from teamredbench.registry import get_benchmark, get_metric, load_plugins
 
@@ -106,6 +107,7 @@ def build_context(suite: SuiteConfig, device_id: int = 0) -> tuple[BenchmarkCont
         dtype_specs=discover_dtypes(torch_module),
         device_id=resolved_device_id,
         repo_root=repo_root,
+        suite_path=suite.path,
     ), profile_note
 
 
@@ -118,9 +120,17 @@ def run_suite(
     started_at = datetime.now(timezone.utc)
     suite = load_suite(suite_path)
     load_plugins(suite.plugins)
+    target_dir = Path(output_dir).resolve() if output_dir else suite.outputs.directory
     context, profile_note = build_context(suite, device_id=device_id)
     suite.hardware_profile = context.hardware_profile
-    target_dir = Path(output_dir).resolve() if output_dir else suite.outputs.directory
+    if profiling_enabled(suite.profiling):
+        return run_profiled_suite(
+            suite=suite,
+            context=context,
+            output_dir=target_dir.resolve(),
+            device_id=device_id,
+            record_callback=record_callback,
+        )
 
     records: list[BenchmarkRecord] = []
     for invocation in suite.benchmarks:
@@ -141,11 +151,13 @@ def run_suite(
         records.extend(benchmark_records)
 
     finished_at = datetime.now(timezone.utc)
+    output_formats = effective_output_formats(suite.outputs.formats)
     run_metadata = build_run_metadata(
         suite=suite,
         context=context,
         requested_device_id=device_id,
         output_dir=target_dir.resolve(),
+        output_formats=output_formats,
         profile_note=profile_note,
         started_at=started_at,
         finished_at=finished_at,
@@ -154,7 +166,7 @@ def run_suite(
         records=records,
         suite_name=suite.name,
         output_dir=target_dir.resolve(),
-        formats=suite.outputs.formats,
+        formats=output_formats,
         run_metadata=run_metadata,
     )
     return RunSummary(

@@ -37,6 +37,14 @@ class OutputConfig:
 
 
 @dataclass
+class ProfilingConfig:
+    enabled: bool = False
+    engine: str | None = None
+    params: dict[str, Any] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class BenchmarkInvocation:
     benchmark: str
     params: dict[str, Any] = field(default_factory=dict)
@@ -50,6 +58,7 @@ class SuiteConfig:
     hardware_profile: HardwareProfile
     runtime_profile: RuntimeProfile
     outputs: OutputConfig
+    profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
     plugins: list[str] = field(default_factory=list)
     path: Path | None = None
     raw: dict[str, Any] = field(default_factory=dict)
@@ -105,6 +114,11 @@ def load_suite(path: str | Path) -> SuiteConfig:
     hardware_path = _resolve(suite_dir, str(data["device"]["profile"]))
     runtime_path = _resolve(suite_dir, str(data["runtime"]["profile"]))
     outputs_data = data.get("outputs", {})
+    profiling_data = data.get("profiling", {})
+    if profiling_data is None:
+        profiling_data = {}
+    if not isinstance(profiling_data, dict):
+        raise ValueError(f"Expected mapping for profiling config in {suite_path}")
 
     benchmarks = [
         BenchmarkInvocation(
@@ -123,6 +137,12 @@ def load_suite(path: str | Path) -> SuiteConfig:
         outputs=OutputConfig(
             directory=_resolve(suite_dir, str(outputs_data.get("directory", "../../results"))),
             formats=list(outputs_data.get("formats", ["json", "csv"])),
+        ),
+        profiling=ProfilingConfig(
+            enabled=bool(profiling_data.get("enabled", bool(profiling_data.get("engine")))),
+            engine=str(profiling_data["engine"]) if profiling_data.get("engine") is not None else None,
+            params=dict(profiling_data.get("params", {})),
+            raw=dict(profiling_data),
         ),
         plugins=list(data.get("plugins", [])),
         path=suite_path,

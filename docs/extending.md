@@ -86,3 +86,152 @@ plugins:
 ```
 
 Any benchmarks or metrics registered by that module become available to the runner.
+
+## Native Kernel Plugins
+
+HBM and MFU also support `backend: native`. The built-in kernels are:
+
+- `hbm_hip`
+- `mfu_hipblas`
+
+Register your own native kernel from a plugin module:
+
+```python
+from pathlib import Path
+
+from teamredbench.native.registry import register_native_kernel
+
+register_native_kernel(
+    name="my_hbm_kernel",
+    benchmark="hbm",
+    description="Custom HIP bandwidth kernel.",
+    source_path=Path(__file__).with_name("my_hbm_kernel.hip.cpp"),
+    compile_args=(),
+)
+```
+
+Then select it in a suite:
+
+```yaml
+plugins:
+  - my_company.teamredbench_native
+
+benchmarks:
+  - benchmark: hbm
+    params:
+      backend: native
+      dtypes: [float32]
+      modes: [copy]
+      size_mib: 4096
+      native:
+        kernel: my_hbm_kernel
+```
+
+You can also skip Python registration and point directly at a source or binary:
+
+```yaml
+native:
+  source: ./my_hbm_kernel.hip.cpp
+```
+
+or:
+
+```yaml
+native:
+  binary: ./my_hbm_kernel
+```
+
+Supported native config keys:
+
+- `kernel`: registered native kernel name
+- `source`: HIP/C++ source path, resolved relative to the suite file
+- `binary`: prebuilt executable path, resolved relative to the suite file
+- `compiler`: compiler override
+- `compile_args`: additional compile flags
+- `run_args`: extra runtime arguments appended after the standard TeamRedBench arguments
+- `env`: environment overrides for the native process
+- `cache_dir`: override the native binary cache location
+
+Runtime contract for custom executables:
+
+- HBM receives:
+  `--dtype --mode --size-mib --warmup --iterations --device-id --scale`
+- MFU receives:
+  `--dtype --m --n --k --warmup --iterations --device-id`
+- The last non-empty line on `stdout` must be JSON shaped like:
+
+```json
+{
+  "status": "ok",
+  "raw_metrics": {
+    "elapsed_s": 0.001
+  },
+  "metadata": {
+    "implementation": "my-kernel"
+  }
+}
+```
+
+Use `status: "skipped"` with an `error` field when a dtype or mode is intentionally unsupported.
+
+## Profiling Engines
+
+Suites can declare a top-level profiling engine:
+
+```yaml
+profiling:
+  enabled: true
+  engine: rocprof
+  params:
+    stats: true
+    hip_trace: true
+```
+
+Built-in profiling engines are registered at import time. You can add your own from a plugin:
+
+```python
+from teamredbench.profiling.registry import ProfilingLaunch, register_profile_engine
+
+def build_command(params, target_command, artifact_dir, base_dir):
+    return ProfilingLaunch(
+        command=("my-profiler", *target_command),
+        artifact_dir=artifact_dir,
+        metadata={"engine": "my-profiler"},
+    )
+
+register_profile_engine(
+    name="my-profiler",
+    description="Example external profiler.",
+    build_command=build_command,
+)
+```
+
+`target_command` is the internal TeamRedBench run command that your profiler should wrap. `artifact_dir` is the directory reserved for profiler outputs. TeamRedBench records that directory in the final metadata file.
+
+Built-in `rocprof` parameters currently supported through `profiling.params`:
+
+- `binary`
+- `tool_version`
+- `input`
+- `metric_file`
+- `output`
+- `data_dir`
+- `temporary_dir`
+- `stats`
+- `roctx_trace`
+- `hip_trace`
+- `hsa_trace`
+- `sys_trace`
+- `roctx_rename`
+- `parallel_kernels`
+- `cmd_qts`
+- `basenames`
+- `timestamp`
+- `ctx_wait`
+- `obj_tracking`
+- `trace_start`
+- `ctx_limit`
+- `heartbeat`
+- `trace_period`
+- `flush_rate`
+- `extra_args`

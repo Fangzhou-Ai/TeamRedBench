@@ -16,6 +16,8 @@ The repo is built to stay adaptable when hardware, ROCm, or metrics change:
 - Hardware profiles live in YAML instead of code.
 - Runtime profiles capture ROCm/library assumptions separately from hardware.
 - Benchmarks and metrics are both registry-driven, so new modules can be added without editing the runner.
+- Native HIP/C++ kernels can be compiled on demand for HBM and MFU paths, or swapped for your own executable.
+- Profiling engines can wrap a suite run and attach external artifacts such as `rocprof` traces.
 - Dtype support is discovered dynamically from the installed `torch` build, including optional float8 types when present.
 
 ## Repo Layout
@@ -74,6 +76,9 @@ The `hbm` benchmark uses large tensor kernels to stress device memory traffic. I
 - `scale`
 - `triad`
 
+The default backend is `torch`. Set `params.backend: native` to run the built-in HIP kernel instead.
+Built-in native kernel name: `hbm_hip`.
+
 Each result reports raw counters and derived metrics such as:
 
 - `hbm_bandwidth_gbps`
@@ -106,6 +111,9 @@ The `mfu` benchmark runs GEMM sweeps and compares achieved throughput against pe
 - `mfu_pct`
 - `latency_us`
 
+The default backend is `torch`. Set `params.backend: native` to run the built-in hipBLAS path instead.
+Built-in native kernel name: `mfu_hipblas`.
+
 For integer and complex dtypes, the repo uses dtype-specific operation-count factors so MFU remains tied to the configured theoretical peak.
 
 ## Dtype Strategy
@@ -119,6 +127,31 @@ For integer and complex dtypes, the repo uses dtype-specific operation-count fac
 - float8 variants when the installed `torch` exposes them
 
 Some dtype and benchmark combinations are not valid on every ROCm stack. Those cases are recorded as `skipped` with an error message instead of aborting the whole suite.
+
+## Profiling
+
+Suites can optionally run under a profiling engine. Built-in support includes:
+
+- `rocprof`
+
+Example:
+
+```yaml
+profiling:
+  enabled: true
+  engine: rocprof
+  params:
+    stats: true
+    hip_trace: true
+```
+
+When profiling is enabled, TeamRedBench launches an internal child run under the selected profiler, then attaches the profiling artifact directory to the normal metadata output. The profile artifact path is also added as `profiling` in the output map inside the `*.metadata.json` file.
+
+List registered profiling engines:
+
+```bash
+teamredbench list-profile-engines
+```
 
 ## Adapting to New Hardware
 
@@ -175,6 +208,47 @@ External modules can also be loaded via the suite `plugins:` field.
 
 More detail is in [docs/extending.md](/root/TeamRedBench/docs/extending.md).
 
+## Native Backends
+
+Native kernels are optional. TeamRedBench will compile them with `hipcc` when you select `backend: native`.
+The compiler can come from:
+
+- `params.native.compiler`
+- `TEAMREDBENCH_HIPCC`
+- `hipcc` in `PATH`
+- `/opt/rocm/bin/hipcc`
+
+You can also point directly at a prebuilt executable with `params.native.binary`.
+
+Example:
+
+```yaml
+benchmarks:
+  - benchmark: hbm
+    params:
+      backend: native
+      dtypes: [float32]
+      modes: [copy, scale, triad]
+      size_mib: 4096
+      native:
+        kernel: hbm_hip
+
+  - benchmark: mfu
+    params:
+      backend: native
+      dtypes: [float16, bfloat16, float32, float64]
+      shapes:
+        - [4096, 4096, 4096]
+      native:
+        kernel: mfu_hipblas
+```
+
+`teamredbench list-native-kernels` shows the registered native kernels.
+
+## rocprof Example
+
+See `configs/suites/rocprof_hbm_smoke.yaml` for a minimal HBM run wrapped by `rocprof`.
+
 ## Example Commands
 
 List built-ins:
@@ -182,7 +256,15 @@ List built-ins:
 ```bash
 teamredbench list-benchmarks
 teamredbench list-metrics
+teamredbench list-native-kernels
+teamredbench list-profile-engines
 teamredbench list-dtypes
+```
+
+Run the example rocprof suite:
+
+```bash
+teamredbench run configs/suites/rocprof_hbm_smoke.yaml
 ```
 
 Run the full suite:
