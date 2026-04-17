@@ -1,3 +1,8 @@
+<!-- Replace docs/assets/logo.jpg with the repo logo image. -->
+<p align="center">
+  <img src="docs/assets/logo.jpg" alt="TeamRedBench logo" width="240">
+</p>
+
 # TeamRedBench
 
 TeamRedBench is a config-driven benchmark repo for AMD RDNA and CDNA GPUs on ROCm. It focuses on three benchmark families out of the box:
