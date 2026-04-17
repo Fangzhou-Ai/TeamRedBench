@@ -106,6 +106,7 @@ def build_context(suite: SuiteConfig, device_id: int = 0) -> tuple[BenchmarkCont
         dtype_specs=discover_dtypes(torch_module),
         device_id=resolved_device_id,
         repo_root=repo_root,
+        suite_path=suite.path,
     ), profile_note
 
 

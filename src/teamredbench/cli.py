@@ -11,6 +11,8 @@ from teamredbench import builtin as _builtin  # noqa: F401
 from teamredbench.benchmarks.base import BenchmarkRecord
 from teamredbench.device import discover_environment, load_torch
 from teamredbench.dtypes import discover_dtypes
+from teamredbench.native.registry import list_native_kernels
+from teamredbench.native.runtime import clear_native_cache, native_cache_dir
 from teamredbench.registry import list_benchmarks, list_metrics
 from teamredbench.runner import run_suite
 
@@ -112,12 +114,30 @@ def list_metrics_command() -> None:
         typer.echo(name)
 
 
+@app.command("list-native-kernels")
+def list_native_kernels_command(
+    benchmark: str | None = typer.Option(None, help="Optional benchmark filter."),
+) -> None:
+    for definition in list_native_kernels(benchmark=benchmark):
+        typer.echo(f"{definition.name} [{definition.benchmark}]")
+
+
 @app.command("list-dtypes")
 def list_dtypes_command() -> None:
     torch_module = load_torch()
     dtypes = discover_dtypes(torch_module)
     for name in sorted(dtypes):
         typer.echo(name)
+
+
+@app.command("clean-native-cache")
+def clean_native_cache_command(
+    cache_dir: Path | None = typer.Option(None, help="Override native kernel cache directory."),
+) -> None:
+    resolved_cache_dir = native_cache_dir(cache_dir.resolve() if cache_dir else None)
+    cleared_dir, removed = clear_native_cache(resolved_cache_dir)
+    typer.echo(f"Native cache: {cleared_dir}")
+    typer.echo(f"Removed entries: {removed}")
 
 
 @app.command()

@@ -19,6 +19,7 @@ class BenchmarkContext:
     dtype_specs: dict[str, DTypeSpec]
     device_id: int = 0
     repo_root: Path | None = None
+    suite_path: Path | None = None
 
 
 @dataclass

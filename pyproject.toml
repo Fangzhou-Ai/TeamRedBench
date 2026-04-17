@@ -26,3 +26,5 @@ teamredbench = "teamredbench.cli:app"
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 
+[tool.setuptools.package-data]
+"teamredbench.native" = ["kernels/*.hip.cpp"]
