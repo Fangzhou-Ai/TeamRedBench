@@ -16,14 +16,17 @@ benchmarks:
       - hbm_efficiency_pct
       - latency_us
     params:
+      backend: torch
       dtypes:
         - float16
         - bfloat16
         - float32
-        - int8
+        - float64
       modes:
         - copy
-      size_mib: 512
+        - scale
+        - triad
+      size_mib: 2048
       warmup: 5
       iterations: 20
   - benchmark: mfu

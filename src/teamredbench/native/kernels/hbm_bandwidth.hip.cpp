@@ -13,20 +13,10 @@
 
 namespace {
 
-constexpr int kThreadsPerBlock = 256;
-constexpr int kComputeVectorUnroll = 4;
+constexpr int kThreadsPerBlock = 512;
+constexpr int kComputeVectorUnroll = 16;
 
-// Native 16-byte vector (4x i32). Required so nontemporal load/store builtins
-// accept the pointer — HIP's int4 wrapper type is rejected by the builtin.
 using Vec16 = int __attribute__((ext_vector_type(4)));
-
-__device__ __forceinline__ Vec16 nt_load(const Vec16* __restrict__ ptr) {
-    return __builtin_nontemporal_load(ptr);
-}
-
-__device__ __forceinline__ void nt_store(Vec16 value, Vec16* __restrict__ ptr) {
-    __builtin_nontemporal_store(value, ptr);
-}
 
 struct Args {
     std::string dtype = "float32";
@@ -101,7 +91,7 @@ __device__ __forceinline__ void triad_vector(Vec16& a, const Vec16& b, T alpha) 
 }
 
 template <typename T>
-__global__ __launch_bounds__(256) void scale_kernel(
+__global__ __launch_bounds__(kThreadsPerBlock) void scale_kernel(
     const T* __restrict__ src, T* __restrict__ dst, T alpha, std::size_t count) {
     constexpr std::size_t vec_width = sizeof(Vec16) / sizeof(T);
 
@@ -109,44 +99,45 @@ __global__ __launch_bounds__(256) void scale_kernel(
     const Vec16* __restrict__ src_v = reinterpret_cast<const Vec16*>(src);
     Vec16* __restrict__ dst_v = reinterpret_cast<Vec16*>(dst);
 
-    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    // Block-chunk pattern: each block processes a contiguous kComputeVectorUnroll*blockDim
+    // chunk of vectors so a wave's unrolled loads hit consecutive HBM rows (better row-
+    // buffer locality than grid-stride with millions of elements between unrolled loads).
+    const std::size_t block_chunk = static_cast<std::size_t>(blockDim.x) * kComputeVectorUnroll;
+    const std::size_t grid_chunk = static_cast<std::size_t>(gridDim.x) * block_chunk;
+    const std::size_t block_stride = blockDim.x;
 
-    std::size_t index = tid;
-    const std::size_t unroll_bound =
-        vec_count >= static_cast<std::size_t>(kComputeVectorUnroll - 1) * stride
-            ? vec_count - static_cast<std::size_t>(kComputeVectorUnroll - 1) * stride
-            : 0;
-    // Wide unroll + nontemporal stores: fills more loads in flight per wave and
-    // skips L2 write-allocate so bandwidth goes to the actual store stream.
-    for(; index < unroll_bound; index += static_cast<std::size_t>(kComputeVectorUnroll) * stride) {
-        Vec16 r0 = src_v[index];
-        Vec16 r1 = src_v[index + stride];
-        Vec16 r2 = src_v[index + 2 * stride];
-        Vec16 r3 = src_v[index + 3 * stride];
-        scale_vector(r0, alpha);
-        scale_vector(r1, alpha);
-        scale_vector(r2, alpha);
-        scale_vector(r3, alpha);
-        nt_store(r0, dst_v + index);
-        nt_store(r1, dst_v + index + stride);
-        nt_store(r2, dst_v + index + 2 * stride);
-        nt_store(r3, dst_v + index + 3 * stride);
+    std::size_t base = static_cast<std::size_t>(blockIdx.x) * block_chunk + threadIdx.x;
+    for(; base + (kComputeVectorUnroll - 1) * block_stride < vec_count; base += grid_chunk) {
+        Vec16 r[kComputeVectorUnroll];
+        #pragma unroll
+        for(int k = 0; k < kComputeVectorUnroll; ++k) {
+            r[k] = src_v[base + k * block_stride];
+        }
+        #pragma unroll
+        for(int k = 0; k < kComputeVectorUnroll; ++k) {
+            scale_vector(r[k], alpha);
+        }
+        #pragma unroll
+        for(int k = 0; k < kComputeVectorUnroll; ++k) {
+            dst_v[base + k * block_stride] = r[k];
+        }
     }
-    for(; index < vec_count; index += stride) {
-        Vec16 raw = src_v[index];
+    for(; base < vec_count; base += block_stride) {
+        Vec16 raw = src_v[base];
         scale_vector(raw, alpha);
-        nt_store(raw, dst_v + index);
+        dst_v[base] = raw;
     }
 
     const std::size_t tail_base = vec_count * vec_width;
-    for(std::size_t j = tail_base + tid; j < count; j += stride) {
+    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t grid_threads = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for(std::size_t j = tail_base + tid; j < count; j += grid_threads) {
         dst[j] = src[j] * alpha;
     }
 }
 
 template <typename T>
-__global__ __launch_bounds__(256) void triad_kernel(
+__global__ __launch_bounds__(kThreadsPerBlock) void triad_kernel(
     const T* __restrict__ src, const T* __restrict__ aux, T* __restrict__ dst,
     T alpha, std::size_t count) {
     constexpr std::size_t vec_width = sizeof(Vec16) / sizeof(T);
@@ -156,41 +147,42 @@ __global__ __launch_bounds__(256) void triad_kernel(
     const Vec16* __restrict__ aux_v = reinterpret_cast<const Vec16*>(aux);
     Vec16* __restrict__ dst_v = reinterpret_cast<Vec16*>(dst);
 
-    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    const std::size_t block_chunk = static_cast<std::size_t>(blockDim.x) * kComputeVectorUnroll;
+    const std::size_t grid_chunk = static_cast<std::size_t>(gridDim.x) * block_chunk;
+    const std::size_t block_stride = blockDim.x;
 
-    std::size_t index = tid;
-    const std::size_t unroll_bound =
-        vec_count >= static_cast<std::size_t>(kComputeVectorUnroll - 1) * stride
-            ? vec_count - static_cast<std::size_t>(kComputeVectorUnroll - 1) * stride
-            : 0;
-    for(; index < unroll_bound; index += static_cast<std::size_t>(kComputeVectorUnroll) * stride) {
-        Vec16 a0 = src_v[index];
-        Vec16 a1 = src_v[index + stride];
-        Vec16 a2 = src_v[index + 2 * stride];
-        Vec16 a3 = src_v[index + 3 * stride];
-        Vec16 b0 = aux_v[index];
-        Vec16 b1 = aux_v[index + stride];
-        Vec16 b2 = aux_v[index + 2 * stride];
-        Vec16 b3 = aux_v[index + 3 * stride];
-        triad_vector(a0, b0, alpha);
-        triad_vector(a1, b1, alpha);
-        triad_vector(a2, b2, alpha);
-        triad_vector(a3, b3, alpha);
-        nt_store(a0, dst_v + index);
-        nt_store(a1, dst_v + index + stride);
-        nt_store(a2, dst_v + index + 2 * stride);
-        nt_store(a3, dst_v + index + 3 * stride);
+    std::size_t base = static_cast<std::size_t>(blockIdx.x) * block_chunk + threadIdx.x;
+    for(; base + (kComputeVectorUnroll - 1) * block_stride < vec_count; base += grid_chunk) {
+        Vec16 a[kComputeVectorUnroll];
+        Vec16 b[kComputeVectorUnroll];
+        #pragma unroll
+        for(int k = 0; k < kComputeVectorUnroll; ++k) {
+            a[k] = src_v[base + k * block_stride];
+        }
+        #pragma unroll
+        for(int k = 0; k < kComputeVectorUnroll; ++k) {
+            b[k] = aux_v[base + k * block_stride];
+        }
+        #pragma unroll
+        for(int k = 0; k < kComputeVectorUnroll; ++k) {
+            triad_vector(a[k], b[k], alpha);
+        }
+        #pragma unroll
+        for(int k = 0; k < kComputeVectorUnroll; ++k) {
+            dst_v[base + k * block_stride] = a[k];
+        }
     }
-    for(; index < vec_count; index += stride) {
-        Vec16 a = src_v[index];
-        const Vec16 b = aux_v[index];
+    for(; base < vec_count; base += block_stride) {
+        Vec16 a = src_v[base];
+        const Vec16 b = aux_v[base];
         triad_vector(a, b, alpha);
-        nt_store(a, dst_v + index);
+        dst_v[base] = a;
     }
 
     const std::size_t tail_base = vec_count * vec_width;
-    for(std::size_t j = tail_base + tid; j < count; j += stride) {
+    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t grid_threads = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for(std::size_t j = tail_base + tid; j < count; j += grid_threads) {
         dst[j] = src[j] + aux[j] * alpha;
     }
 }
