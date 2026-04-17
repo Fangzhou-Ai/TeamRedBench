@@ -13,6 +13,10 @@
 
 namespace {
 
+constexpr int kThreadsPerBlock = 256;
+constexpr int kCopyVectorUnroll = 4;
+constexpr int kComputeVectorUnroll = 2;
+
 struct Args {
     std::string dtype = "float32";
     std::string mode = "copy";
@@ -65,20 +69,104 @@ Args parse_args(int argc, char** argv) {
 }
 
 template <typename T>
-__global__ void scale_kernel(const T* src, T* dst, T alpha, std::size_t count) {
-    std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
-    for(; index < count; index += stride) {
-        dst[index] = src[index] * alpha;
+__device__ __forceinline__ void scale_vector(int4& raw, T alpha) {
+    constexpr std::size_t vec_width = sizeof(int4) / sizeof(T);
+    T* lane = reinterpret_cast<T*>(&raw);
+    #pragma unroll
+    for(std::size_t k = 0; k < vec_width; ++k) {
+        lane[k] = lane[k] * alpha;
     }
 }
 
 template <typename T>
-__global__ void triad_kernel(const T* src, T* aux, T* dst, T alpha, std::size_t count) {
-    std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
-    for(; index < count; index += stride) {
-        dst[index] = src[index] + aux[index] * alpha;
+__device__ __forceinline__ void triad_vector(int4& a, const int4& b, T alpha) {
+    constexpr std::size_t vec_width = sizeof(int4) / sizeof(T);
+    T* a_lane = reinterpret_cast<T*>(&a);
+    const T* b_lane = reinterpret_cast<const T*>(&b);
+    #pragma unroll
+    for(std::size_t k = 0; k < vec_width; ++k) {
+        a_lane[k] = a_lane[k] + b_lane[k] * alpha;
+    }
+}
+
+template <typename T>
+__global__ __launch_bounds__(256) void scale_kernel(
+    const T* __restrict__ src, T* __restrict__ dst, T alpha, std::size_t count) {
+    using Vec = int4;
+    constexpr std::size_t vec_width = sizeof(Vec) / sizeof(T);
+
+    const std::size_t vec_count = count / vec_width;
+    const Vec* __restrict__ src_v = reinterpret_cast<const Vec*>(src);
+    Vec* __restrict__ dst_v = reinterpret_cast<Vec*>(dst);
+
+    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+
+    std::size_t index = tid;
+    const std::size_t unroll_bound =
+        vec_count >= static_cast<std::size_t>(kComputeVectorUnroll - 1) * stride
+            ? vec_count - static_cast<std::size_t>(kComputeVectorUnroll - 1) * stride
+            : 0;
+    for(; index < unroll_bound; index += static_cast<std::size_t>(kComputeVectorUnroll) * stride) {
+        Vec raw0 = src_v[index];
+        Vec raw1 = src_v[index + stride];
+        scale_vector(raw0, alpha);
+        scale_vector(raw1, alpha);
+        dst_v[index] = raw0;
+        dst_v[index + stride] = raw1;
+    }
+    for(; index < vec_count; index += stride) {
+        Vec raw = src_v[index];
+        scale_vector(raw, alpha);
+        dst_v[index] = raw;
+    }
+
+    const std::size_t tail_base = vec_count * vec_width;
+    for(std::size_t j = tail_base + tid; j < count; j += stride) {
+        dst[j] = src[j] * alpha;
+    }
+}
+
+template <typename T>
+__global__ __launch_bounds__(256) void triad_kernel(
+    const T* __restrict__ src, const T* __restrict__ aux, T* __restrict__ dst,
+    T alpha, std::size_t count) {
+    using Vec = int4;
+    constexpr std::size_t vec_width = sizeof(Vec) / sizeof(T);
+
+    const std::size_t vec_count = count / vec_width;
+    const Vec* __restrict__ src_v = reinterpret_cast<const Vec*>(src);
+    const Vec* __restrict__ aux_v = reinterpret_cast<const Vec*>(aux);
+    Vec* __restrict__ dst_v = reinterpret_cast<Vec*>(dst);
+
+    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+
+    std::size_t index = tid;
+    const std::size_t unroll_bound =
+        vec_count >= static_cast<std::size_t>(kComputeVectorUnroll - 1) * stride
+            ? vec_count - static_cast<std::size_t>(kComputeVectorUnroll - 1) * stride
+            : 0;
+    for(; index < unroll_bound; index += static_cast<std::size_t>(kComputeVectorUnroll) * stride) {
+        Vec a0 = src_v[index];
+        Vec b0 = aux_v[index];
+        Vec a1 = src_v[index + stride];
+        Vec b1 = aux_v[index + stride];
+        triad_vector(a0, b0, alpha);
+        triad_vector(a1, b1, alpha);
+        dst_v[index] = a0;
+        dst_v[index + stride] = a1;
+    }
+    for(; index < vec_count; index += stride) {
+        Vec a = src_v[index];
+        const Vec b = aux_v[index];
+        triad_vector(a, b, alpha);
+        dst_v[index] = a;
+    }
+
+    const std::size_t tail_base = vec_count * vec_width;
+    for(std::size_t j = tail_base + tid; j < count; j += stride) {
+        dst[j] = src[j] + aux[j] * alpha;
     }
 }
 
@@ -116,12 +204,18 @@ double run_kernel(const Args& args) {
     check_hip(hipEventCreate(&start), "hipEventCreate(start)");
     check_hip(hipEventCreate(&stop), "hipEventCreate(stop)");
 
-    const int threads = 256;
-    const int max_blocks = std::max(1, props.multiProcessorCount * 8);
-    const int blocks = std::min<int>(
-        max_blocks,
-        static_cast<int>((count + static_cast<std::size_t>(threads) - 1) / static_cast<std::size_t>(threads))
-    );
+    const int threads = kThreadsPerBlock;
+    // A wide grid keeps multiple wavefronts per CU queued without pushing the
+    // per-thread work chunk so small that loop overhead dominates.
+    constexpr std::size_t vec_bytes = 16;
+    const std::size_t vec_count = data_bytes / vec_bytes;
+    const int max_blocks = std::max(1, props.multiProcessorCount * 16);
+    const int blocks_by_work = static_cast<int>(std::min<std::size_t>(
+        static_cast<std::size_t>(max_blocks),
+        std::max<std::size_t>(1, (vec_count + static_cast<std::size_t>(threads) - 1)
+                                 / static_cast<std::size_t>(threads))
+    ));
+    const int blocks = std::max(1, blocks_by_work);
     const T alpha = static_cast<T>(args.scale);
 
     auto launch_once = [&]() {
