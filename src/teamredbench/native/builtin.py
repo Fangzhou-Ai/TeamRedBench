@@ -18,6 +18,6 @@ register_native_kernel(
 register_native_kernel(
     name="mfu_hipblas",
     benchmark="mfu",
-    description="Tiled HIP GEMM kernel for MFU measurements.",
+    description="rocWMMA/MFMA GEMM kernel for MFU measurements with scalar fallback.",
     source_path=KERNEL_DIR / "mfu_gemm.hip.cpp",
 )

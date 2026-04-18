@@ -1,6 +1,7 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <rocwmma/rocwmma.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -18,28 +19,74 @@ struct KernelTuning {
     static constexpr int kThreadsY = 16;
     static constexpr int kThreadTileM = 4;
     static constexpr int kThreadTileN = 4;
-    static constexpr int kBlockTileK = 8;
-    static constexpr int kBlocksPerCu = 8;
+    static constexpr int kScalarBlockTileK = 8;
+    static constexpr int kScalarBlocksPerCu = 8;
+
+    static constexpr int kFragM = 16;
+    static constexpr int kFragN = 16;
+    static constexpr int kFragK = 16;
+    static constexpr int kMfmaWaveGridM = 2;
+    static constexpr int kMfmaWaveGridN = 2;
+    static constexpr int kMfmaWaveTileM = 2;
+    static constexpr int kMfmaWaveTileN = 2;
+    static constexpr int kMfmaBlocksPerCu = 8;
 };
 
 template <>
-struct KernelTuning<__half> {
+struct KernelTuning<rocwmma::float16_t> {
     static constexpr int kThreadsX = 16;
     static constexpr int kThreadsY = 16;
     static constexpr int kThreadTileM = 4;
     static constexpr int kThreadTileN = 4;
-    static constexpr int kBlockTileK = 16;
-    static constexpr int kBlocksPerCu = 8;
+    static constexpr int kScalarBlockTileK = 16;
+    static constexpr int kScalarBlocksPerCu = 8;
+
+    static constexpr int kFragM = 16;
+    static constexpr int kFragN = 16;
+    static constexpr int kFragK = 16;
+    static constexpr int kMfmaWaveGridM = 2;
+    static constexpr int kMfmaWaveGridN = 2;
+    static constexpr int kMfmaWaveTileM = 4;
+    static constexpr int kMfmaWaveTileN = 2;
+    static constexpr int kMfmaBlocksPerCu = 8;
 };
 
 template <>
-struct KernelTuning<hip_bfloat16> {
+struct KernelTuning<rocwmma::bfloat16_t> {
     static constexpr int kThreadsX = 16;
     static constexpr int kThreadsY = 16;
     static constexpr int kThreadTileM = 4;
     static constexpr int kThreadTileN = 4;
-    static constexpr int kBlockTileK = 16;
-    static constexpr int kBlocksPerCu = 6;
+    static constexpr int kScalarBlockTileK = 16;
+    static constexpr int kScalarBlocksPerCu = 6;
+
+    static constexpr int kFragM = 16;
+    static constexpr int kFragN = 16;
+    static constexpr int kFragK = 16;
+    static constexpr int kMfmaWaveGridM = 2;
+    static constexpr int kMfmaWaveGridN = 2;
+    static constexpr int kMfmaWaveTileM = 4;
+    static constexpr int kMfmaWaveTileN = 2;
+    static constexpr int kMfmaBlocksPerCu = 6;
+};
+
+template <>
+struct KernelTuning<float> {
+    static constexpr int kThreadsX = 16;
+    static constexpr int kThreadsY = 16;
+    static constexpr int kThreadTileM = 4;
+    static constexpr int kThreadTileN = 4;
+    static constexpr int kScalarBlockTileK = 8;
+    static constexpr int kScalarBlocksPerCu = 8;
+
+    static constexpr int kFragM = 16;
+    static constexpr int kFragN = 16;
+    static constexpr int kFragK = 16;
+    static constexpr int kMfmaWaveGridM = 2;
+    static constexpr int kMfmaWaveGridN = 2;
+    static constexpr int kMfmaWaveTileM = 2;
+    static constexpr int kMfmaWaveTileN = 2;
+    static constexpr int kMfmaBlocksPerCu = 16;
 };
 
 template <>
@@ -48,8 +95,17 @@ struct KernelTuning<double> {
     static constexpr int kThreadsY = 8;
     static constexpr int kThreadTileM = 4;
     static constexpr int kThreadTileN = 4;
-    static constexpr int kBlockTileK = 4;
-    static constexpr int kBlocksPerCu = 16;
+    static constexpr int kScalarBlockTileK = 4;
+    static constexpr int kScalarBlocksPerCu = 16;
+
+    static constexpr int kFragM = 16;
+    static constexpr int kFragN = 16;
+    static constexpr int kFragK = 4;
+    static constexpr int kMfmaWaveGridM = 2;
+    static constexpr int kMfmaWaveGridN = 2;
+    static constexpr int kMfmaWaveTileM = 2;
+    static constexpr int kMfmaWaveTileN = 2;
+    static constexpr int kMfmaBlocksPerCu = 12;
 };
 
 template <typename T>
@@ -58,12 +114,12 @@ struct AccumulatorType {
 };
 
 template <>
-struct AccumulatorType<__half> {
+struct AccumulatorType<rocwmma::float16_t> {
     using type = float;
 };
 
 template <>
-struct AccumulatorType<hip_bfloat16> {
+struct AccumulatorType<rocwmma::bfloat16_t> {
     using type = float;
 };
 
@@ -71,18 +127,33 @@ template <typename T>
 using AccumT = typename AccumulatorType<T>::type;
 
 template <typename T>
-constexpr int threads_per_block() {
+constexpr int scalar_threads_per_block() {
     return KernelTuning<T>::kThreadsX * KernelTuning<T>::kThreadsY;
 }
 
 template <typename T>
-constexpr int block_tile_m() {
+constexpr int scalar_block_tile_m() {
     return KernelTuning<T>::kThreadsY * KernelTuning<T>::kThreadTileM;
 }
 
 template <typename T>
-constexpr int block_tile_n() {
+constexpr int scalar_block_tile_n() {
     return KernelTuning<T>::kThreadsX * KernelTuning<T>::kThreadTileN;
+}
+
+template <typename T>
+constexpr int mfma_threads_per_block() {
+    return 64 * KernelTuning<T>::kMfmaWaveGridM * KernelTuning<T>::kMfmaWaveGridN;
+}
+
+template <typename T>
+constexpr int mfma_block_tile_m() {
+    return KernelTuning<T>::kFragM * KernelTuning<T>::kMfmaWaveGridM * KernelTuning<T>::kMfmaWaveTileM;
+}
+
+template <typename T>
+constexpr int mfma_block_tile_n() {
+    return KernelTuning<T>::kFragN * KernelTuning<T>::kMfmaWaveGridN * KernelTuning<T>::kMfmaWaveTileN;
 }
 
 struct Args {
@@ -158,13 +229,8 @@ __host__ __device__ T cast_scalar(double value) {
 }
 
 template <>
-__host__ __device__ __half cast_scalar<__half>(double value) {
-    return __half(static_cast<float>(value));
-}
-
-template <>
-__host__ __device__ hip_bfloat16 cast_scalar<hip_bfloat16>(double value) {
-    return hip_bfloat16(static_cast<float>(value));
+__host__ __device__ rocwmma::bfloat16_t cast_scalar<rocwmma::bfloat16_t>(double value) {
+    return rocwmma::bfloat16_t(static_cast<float>(value));
 }
 
 template <typename T>
@@ -173,11 +239,19 @@ __host__ __device__ AccumT<T> to_accum(T value) {
 }
 
 template <typename T>
-int resolve_blocks_per_cu(const Args& args) {
+int resolve_scalar_blocks_per_cu(const Args& args) {
     if(args.blocks_per_cu > 0) {
         return args.blocks_per_cu;
     }
-    return KernelTuning<T>::kBlocksPerCu;
+    return KernelTuning<T>::kScalarBlocksPerCu;
+}
+
+template <typename T>
+int resolve_mfma_blocks_per_cu(const Args& args) {
+    if(args.blocks_per_cu > 0) {
+        return args.blocks_per_cu;
+    }
+    return KernelTuning<T>::kMfmaBlocksPerCu;
 }
 
 template <typename T>
@@ -195,11 +269,11 @@ template <
     int ThreadsY = KernelTuning<T>::kThreadsY,
     int ThreadTileM = KernelTuning<T>::kThreadTileM,
     int ThreadTileN = KernelTuning<T>::kThreadTileN,
-    int BlockTileK = KernelTuning<T>::kBlockTileK>
-__global__ __launch_bounds__(ThreadsX * ThreadsY) void gemm_kernel(
+    int BlockTileK = KernelTuning<T>::kScalarBlockTileK>
+__global__ __launch_bounds__(ThreadsX * ThreadsY) void scalar_gemm_kernel(
     const T* __restrict__ a,
     const T* __restrict__ b,
-    T* __restrict__ c,
+    AccumT<T>* __restrict__ c,
     int m,
     int n,
     int k) {
@@ -207,9 +281,6 @@ __global__ __launch_bounds__(ThreadsX * ThreadsY) void gemm_kernel(
     constexpr int kThreadsPerBlock = ThreadsX * ThreadsY;
     constexpr int kBlockTileM = ThreadsY * ThreadTileM;
     constexpr int kBlockTileN = ThreadsX * ThreadTileN;
-
-    static_assert(kBlockTileM > 0 && kBlockTileN > 0 && BlockTileK > 0, "tile sizes must be positive");
-    static_assert(kThreadsPerBlock > 0, "threads per block must be positive");
 
     __shared__ T a_tile[kBlockTileM * BlockTileK];
     __shared__ T b_tile[BlockTileK * kBlockTileN];
@@ -295,16 +366,135 @@ __global__ __launch_bounds__(ThreadsX * ThreadsY) void gemm_kernel(
                 if(global_col >= n) {
                     continue;
                 }
-                c[static_cast<std::size_t>(global_row) * static_cast<std::size_t>(n) + static_cast<std::size_t>(global_col)] =
-                    cast_scalar<T>(static_cast<double>(accum[i][j]));
+                c[static_cast<std::size_t>(global_row) * static_cast<std::size_t>(n)
+                  + static_cast<std::size_t>(global_col)] = accum[i][j];
+            }
+        }
+    }
+}
+
+template <
+    typename T,
+    int FragM = KernelTuning<T>::kFragM,
+    int FragN = KernelTuning<T>::kFragN,
+    int FragK = KernelTuning<T>::kFragK,
+    int WaveGridM = KernelTuning<T>::kMfmaWaveGridM,
+    int WaveGridN = KernelTuning<T>::kMfmaWaveGridN,
+    int WaveTileM = KernelTuning<T>::kMfmaWaveTileM,
+    int WaveTileN = KernelTuning<T>::kMfmaWaveTileN>
+__global__ __launch_bounds__(64 * WaveGridM * WaveGridN) void mfma_gemm_kernel(
+    const T* __restrict__ a,
+    const T* __restrict__ b,
+    AccumT<T>* __restrict__ c,
+    int m,
+    int n,
+    int k) {
+    using Acc = AccumT<T>;
+    using FragA = rocwmma::fragment<rocwmma::matrix_a, FragM, FragN, FragK, T, rocwmma::row_major>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b, FragM, FragN, FragK, T, rocwmma::row_major>;
+    using FragC = rocwmma::fragment<rocwmma::accumulator, FragM, FragN, FragK, Acc>;
+
+    constexpr int kThreadsPerBlock = 64 * WaveGridM * WaveGridN;
+    constexpr int kBlockTileM = FragM * WaveGridM * WaveTileM;
+    constexpr int kBlockTileN = FragN * WaveGridN * WaveTileN;
+    static_assert(kThreadsPerBlock <= 1024, "MFMA kernel exceeds max threads per block");
+
+    __shared__ T a_tile[kBlockTileM * FragK];
+    __shared__ T b_tile[FragK * kBlockTileN];
+
+    const int linear_tid = static_cast<int>(threadIdx.x);
+    const int wave_id = linear_tid / 64;
+    const int wave_row = wave_id / WaveGridN;
+    const int wave_col = wave_id % WaveGridN;
+
+    const int tiles_n = n / kBlockTileN;
+    const int tiles_m = m / kBlockTileM;
+    const int total_tiles = tiles_m * tiles_n;
+
+    for(int tile_linear = static_cast<int>(blockIdx.x); tile_linear < total_tiles; tile_linear += static_cast<int>(gridDim.x)) {
+        const int tile_row = tile_linear / tiles_n;
+        const int tile_col = tile_linear % tiles_n;
+        const int row_base = tile_row * kBlockTileM;
+        const int col_base = tile_col * kBlockTileN;
+
+        FragC accum[WaveTileM][WaveTileN];
+        #pragma unroll
+        for(int i = 0; i < WaveTileM; ++i) {
+            #pragma unroll
+            for(int j = 0; j < WaveTileN; ++j) {
+                rocwmma::fill_fragment(accum[i][j], static_cast<Acc>(0));
+            }
+        }
+
+        for(int k_base = 0; k_base < k; k_base += FragK) {
+            for(int index = linear_tid; index < kBlockTileM * FragK; index += kThreadsPerBlock) {
+                const int tile_row_offset = index / FragK;
+                const int tile_k_offset = index % FragK;
+                a_tile[index] = a[static_cast<std::size_t>(row_base + tile_row_offset) * static_cast<std::size_t>(k)
+                                  + static_cast<std::size_t>(k_base + tile_k_offset)];
+            }
+            for(int index = linear_tid; index < FragK * kBlockTileN; index += kThreadsPerBlock) {
+                const int tile_k_offset = index / kBlockTileN;
+                const int tile_col_offset = index % kBlockTileN;
+                b_tile[index] = b[static_cast<std::size_t>(k_base + tile_k_offset) * static_cast<std::size_t>(n)
+                                  + static_cast<std::size_t>(col_base + tile_col_offset)];
+            }
+            __syncthreads();
+
+            FragA a_frag[WaveTileM];
+            FragB b_frag[WaveTileN];
+
+            #pragma unroll
+            for(int i = 0; i < WaveTileM; ++i) {
+                const int a_row = (wave_row * WaveTileM + i) * FragM;
+                rocwmma::load_matrix_sync(a_frag[i], &a_tile[a_row * FragK], FragK);
+            }
+            #pragma unroll
+            for(int j = 0; j < WaveTileN; ++j) {
+                const int b_col = (wave_col * WaveTileN + j) * FragN;
+                rocwmma::load_matrix_sync(b_frag[j], &b_tile[b_col], kBlockTileN);
+            }
+
+            #pragma unroll
+            for(int i = 0; i < WaveTileM; ++i) {
+                #pragma unroll
+                for(int j = 0; j < WaveTileN; ++j) {
+                    rocwmma::mma_sync(accum[i][j], a_frag[i], b_frag[j], accum[i][j]);
+                }
+            }
+            __syncthreads();
+        }
+
+        #pragma unroll
+        for(int i = 0; i < WaveTileM; ++i) {
+            const int global_row = row_base + (wave_row * WaveTileM + i) * FragM;
+            #pragma unroll
+            for(int j = 0; j < WaveTileN; ++j) {
+                const int global_col = col_base + (wave_col * WaveTileN + j) * FragN;
+                rocwmma::store_matrix_sync(
+                    &c[static_cast<std::size_t>(global_row) * static_cast<std::size_t>(n)
+                       + static_cast<std::size_t>(global_col)],
+                    accum[i][j],
+                    n,
+                    rocwmma::mem_row_major
+                );
             }
         }
     }
 }
 
 template <typename T>
-double run_kernel(const Args& args) {
+bool can_use_mfma(const Args& args) {
+    return (args.m % mfma_block_tile_m<T>() == 0)
+        && (args.n % mfma_block_tile_n<T>() == 0)
+        && (args.k % KernelTuning<T>::kFragK == 0);
+}
+
+template <typename T>
+double run_kernel(const Args& args, bool* used_mfma) {
     check_hip(hipSetDevice(args.device_id), "hipSetDevice");
+
+    using Acc = AccumT<T>;
 
     const std::size_t a_count = static_cast<std::size_t>(args.m) * static_cast<std::size_t>(args.k);
     const std::size_t b_count = static_cast<std::size_t>(args.k) * static_cast<std::size_t>(args.n);
@@ -312,7 +502,7 @@ double run_kernel(const Args& args) {
 
     T* a = nullptr;
     T* b = nullptr;
-    T* c = nullptr;
+    Acc* c = nullptr;
     hipStream_t stream = nullptr;
     hipEvent_t start = nullptr;
     hipEvent_t stop = nullptr;
@@ -322,7 +512,7 @@ double run_kernel(const Args& args) {
 
     check_hip(hipMalloc(&reinterpret_cast<void*&>(a), a_count * sizeof(T)), "hipMalloc(a)");
     check_hip(hipMalloc(&reinterpret_cast<void*&>(b), b_count * sizeof(T)), "hipMalloc(b)");
-    check_hip(hipMalloc(&reinterpret_cast<void*&>(c), c_count * sizeof(T)), "hipMalloc(c)");
+    check_hip(hipMalloc(&reinterpret_cast<void*&>(c), c_count * sizeof(Acc)), "hipMalloc(c)");
 
     check_hip(hipStreamCreate(&stream), "hipStreamCreate");
     check_hip(hipEventCreate(&start), "hipEventCreate(start)");
@@ -342,23 +532,51 @@ double run_kernel(const Args& args) {
     check_hip(hipGetLastError(), "fill_kernel(a)");
     hipLaunchKernelGGL(fill_kernel<T>, dim3(init_blocks), dim3(kInitThreads), 0, stream, b, b_count, cast_scalar<T>(0.03125));
     check_hip(hipGetLastError(), "fill_kernel(b)");
-    hipLaunchKernelGGL(fill_kernel<T>, dim3(init_blocks), dim3(kInitThreads), 0, stream, c, c_count, cast_scalar<T>(0.0));
+    hipLaunchKernelGGL(fill_kernel<Acc>, dim3(init_blocks), dim3(kInitThreads), 0, stream, c, c_count, static_cast<Acc>(0));
     check_hip(hipGetLastError(), "fill_kernel(c)");
     check_hip(hipStreamSynchronize(stream), "hipStreamSynchronize(init)");
 
-    constexpr int kThreadsX = KernelTuning<T>::kThreadsX;
-    constexpr int kThreadsY = KernelTuning<T>::kThreadsY;
-    constexpr int kBlockTileM = block_tile_m<T>();
-    constexpr int kBlockTileN = block_tile_n<T>();
-    const int tiles_m = (args.m + kBlockTileM - 1) / kBlockTileM;
-    const int tiles_n = (args.n + kBlockTileN - 1) / kBlockTileN;
-    const int total_tiles = std::max(1, tiles_m * tiles_n);
-    const int blocks = std::max(1, std::min(total_tiles, props.multiProcessorCount * std::max(1, resolve_blocks_per_cu<T>(args))));
-    const dim3 threads(kThreadsX, kThreadsY);
+    const bool use_mfma = can_use_mfma<T>(args);
+    if(used_mfma != nullptr) {
+        *used_mfma = use_mfma;
+    }
 
     auto launch_once = [&]() {
-        hipLaunchKernelGGL(gemm_kernel<T>, dim3(blocks), threads, 0, stream, a, b, c, args.m, args.n, args.k);
-        check_hip(hipGetLastError(), "gemm_kernel");
+        if(use_mfma) {
+            const int blocks = std::max(
+                1,
+                std::min(
+                    std::max(1, (args.m / mfma_block_tile_m<T>()) * (args.n / mfma_block_tile_n<T>())),
+                    props.multiProcessorCount * std::max(1, resolve_mfma_blocks_per_cu<T>(args))
+                )
+            );
+            hipLaunchKernelGGL(mfma_gemm_kernel<T>, dim3(blocks), dim3(mfma_threads_per_block<T>()), 0, stream, a, b, c, args.m, args.n, args.k);
+            check_hip(hipGetLastError(), "mfma_gemm_kernel");
+            return;
+        }
+
+        const int blocks = std::max(
+            1,
+            std::min(
+                std::max(1, ((args.m + scalar_block_tile_m<T>() - 1) / scalar_block_tile_m<T>())
+                              * ((args.n + scalar_block_tile_n<T>() - 1) / scalar_block_tile_n<T>())),
+                props.multiProcessorCount * std::max(1, resolve_scalar_blocks_per_cu<T>(args))
+            )
+        );
+        hipLaunchKernelGGL(
+            scalar_gemm_kernel<T>,
+            dim3(blocks),
+            dim3(KernelTuning<T>::kThreadsX, KernelTuning<T>::kThreadsY),
+            0,
+            stream,
+            a,
+            b,
+            c,
+            args.m,
+            args.n,
+            args.k
+        );
+        check_hip(hipGetLastError(), "scalar_gemm_kernel");
     };
 
     for(int iteration = 0; iteration < args.warmup; ++iteration) {
@@ -401,17 +619,29 @@ double run_kernel(const Args& args) {
 
 template <typename T>
 int emit_success(const Args& args) {
-    const double elapsed_s = run_kernel<T>(args);
+    bool used_mfma = false;
+    const double elapsed_s = run_kernel<T>(args, &used_mfma);
     std::cout << "{\"status\":\"ok\",\"raw_metrics\":{\"elapsed_s\":" << elapsed_s
-              << "},\"metadata\":{\"implementation\":\"hip\""
-              << ",\"threads_per_block\":" << threads_per_block<T>()
-              << ",\"thread_tile_m\":" << KernelTuning<T>::kThreadTileM
-              << ",\"thread_tile_n\":" << KernelTuning<T>::kThreadTileN
-              << ",\"tile_m\":" << block_tile_m<T>()
-              << ",\"tile_n\":" << block_tile_n<T>()
-              << ",\"tile_k\":" << KernelTuning<T>::kBlockTileK
-              << ",\"blocks_per_cu\":" << resolve_blocks_per_cu<T>(args)
-              << "}}" << std::endl;
+              << "},\"metadata\":{\"implementation\":\"" << (used_mfma ? "rocwmma_mfma" : "hip_scalar")
+              << "\",\"threads_per_block\":" << (used_mfma ? mfma_threads_per_block<T>() : scalar_threads_per_block<T>())
+              << ",\"tile_m\":" << (used_mfma ? mfma_block_tile_m<T>() : scalar_block_tile_m<T>())
+              << ",\"tile_n\":" << (used_mfma ? mfma_block_tile_n<T>() : scalar_block_tile_n<T>())
+              << ",\"tile_k\":" << (used_mfma ? KernelTuning<T>::kFragK : KernelTuning<T>::kScalarBlockTileK)
+              << ",\"blocks_per_cu\":"
+              << (used_mfma ? resolve_mfma_blocks_per_cu<T>(args) : resolve_scalar_blocks_per_cu<T>(args));
+    if(used_mfma) {
+        std::cout << ",\"wave_grid_m\":" << KernelTuning<T>::kMfmaWaveGridM
+                  << ",\"wave_grid_n\":" << KernelTuning<T>::kMfmaWaveGridN
+                  << ",\"wave_tile_m\":" << KernelTuning<T>::kMfmaWaveTileM
+                  << ",\"wave_tile_n\":" << KernelTuning<T>::kMfmaWaveTileN
+                  << ",\"frag_m\":" << KernelTuning<T>::kFragM
+                  << ",\"frag_n\":" << KernelTuning<T>::kFragN
+                  << ",\"frag_k\":" << KernelTuning<T>::kFragK;
+    } else {
+        std::cout << ",\"thread_tile_m\":" << KernelTuning<T>::kThreadTileM
+                  << ",\"thread_tile_n\":" << KernelTuning<T>::kThreadTileN;
+    }
+    std::cout << "}}" << std::endl;
     return 0;
 }
 
@@ -437,10 +667,10 @@ int main(int argc, char** argv) {
     try {
         const Args args = parse_args(argc, argv);
         if(args.dtype == "float16") {
-            return emit_success<__half>(args);
+            return emit_success<rocwmma::float16_t>(args);
         }
         if(args.dtype == "bfloat16") {
-            return emit_success<hip_bfloat16>(args);
+            return emit_success<rocwmma::bfloat16_t>(args);
         }
         if(args.dtype == "float32") {
             return emit_success<float>(args);
