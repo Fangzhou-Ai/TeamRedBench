@@ -15,8 +15,17 @@ namespace {
 
 constexpr int kThreadsPerBlock = 512;
 constexpr int kComputeVectorUnroll = 16;
+static_assert(kComputeVectorUnroll % 2 == 0, "double-buffered pipeline requires even unroll");
+constexpr int kPipelineStage = kComputeVectorUnroll / 2;
 
 using Vec16 = int __attribute__((ext_vector_type(4)));
+
+__device__ __forceinline__ Vec16 nt_load(const Vec16* __restrict__ p) {
+    // Streaming loads: the working set (>=1 GiB) dwarfs L2, so bypassing the
+    // cache with a nontemporal load frees L2 bandwidth for address/metadata
+    // traffic and measurably lifts sustained HBM read BW on CDNA.
+    return __builtin_nontemporal_load(p);
+}
 
 struct Args {
     std::string dtype = "float32";
@@ -26,6 +35,7 @@ struct Args {
     int iterations = 50;
     int device_id = 0;
     double scale = 1.0;
+    int blocks_per_cu = 16;
 };
 
 [[noreturn]] void fail(const std::string& message) {
@@ -62,6 +72,8 @@ Args parse_args(int argc, char** argv) {
             args.device_id = std::stoi(value);
         } else if(key == "--scale") {
             args.scale = std::stod(value);
+        } else if(key == "--blocks-per-cu") {
+            args.blocks_per_cu = std::stoi(value);
         } else {
             fail("unknown argument " + key);
         }
@@ -108,18 +120,35 @@ __global__ __launch_bounds__(kThreadsPerBlock) void scale_kernel(
 
     std::size_t base = static_cast<std::size_t>(blockIdx.x) * block_chunk + threadIdx.x;
     for(; base + (kComputeVectorUnroll - 1) * block_stride < vec_count; base += grid_chunk) {
-        Vec16 r[kComputeVectorUnroll];
+        // Two-stage software pipeline: issue second-half loads while the first
+        // half is still in flight/being computed, then overlap first-half
+        // stores with second-half compute. Gives the scheduler strictly more
+        // independent work across the load/compute/store phases.
+        Vec16 r0[kPipelineStage];
+        Vec16 r1[kPipelineStage];
         #pragma unroll
-        for(int k = 0; k < kComputeVectorUnroll; ++k) {
-            r[k] = src_v[base + k * block_stride];
+        for(int k = 0; k < kPipelineStage; ++k) {
+            r0[k] = nt_load(&src_v[base + k * block_stride]);
         }
         #pragma unroll
-        for(int k = 0; k < kComputeVectorUnroll; ++k) {
-            scale_vector(r[k], alpha);
+        for(int k = 0; k < kPipelineStage; ++k) {
+            r1[k] = nt_load(&src_v[base + (k + kPipelineStage) * block_stride]);
         }
         #pragma unroll
-        for(int k = 0; k < kComputeVectorUnroll; ++k) {
-            dst_v[base + k * block_stride] = r[k];
+        for(int k = 0; k < kPipelineStage; ++k) {
+            scale_vector(r0[k], alpha);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            dst_v[base + k * block_stride] = r0[k];
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            scale_vector(r1[k], alpha);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            dst_v[base + (k + kPipelineStage) * block_stride] = r1[k];
         }
     }
     for(; base < vec_count; base += block_stride) {
@@ -153,23 +182,38 @@ __global__ __launch_bounds__(kThreadsPerBlock) void triad_kernel(
 
     std::size_t base = static_cast<std::size_t>(blockIdx.x) * block_chunk + threadIdx.x;
     for(; base + (kComputeVectorUnroll - 1) * block_stride < vec_count; base += grid_chunk) {
-        Vec16 a[kComputeVectorUnroll];
-        Vec16 b[kComputeVectorUnroll];
+        // Two-stage pipeline with src/aux interleaved within each stage: the
+        // HBM controller sees requests on both input buffers early, and the
+        // second-half loads issue while the first half is computing/storing.
+        Vec16 a0[kPipelineStage];
+        Vec16 b0[kPipelineStage];
+        Vec16 a1[kPipelineStage];
+        Vec16 b1[kPipelineStage];
         #pragma unroll
-        for(int k = 0; k < kComputeVectorUnroll; ++k) {
-            a[k] = src_v[base + k * block_stride];
+        for(int k = 0; k < kPipelineStage; ++k) {
+            a0[k] = nt_load(&src_v[base + k * block_stride]);
+            b0[k] = nt_load(&aux_v[base + k * block_stride]);
         }
         #pragma unroll
-        for(int k = 0; k < kComputeVectorUnroll; ++k) {
-            b[k] = aux_v[base + k * block_stride];
+        for(int k = 0; k < kPipelineStage; ++k) {
+            a1[k] = nt_load(&src_v[base + (k + kPipelineStage) * block_stride]);
+            b1[k] = nt_load(&aux_v[base + (k + kPipelineStage) * block_stride]);
         }
         #pragma unroll
-        for(int k = 0; k < kComputeVectorUnroll; ++k) {
-            triad_vector(a[k], b[k], alpha);
+        for(int k = 0; k < kPipelineStage; ++k) {
+            triad_vector(a0[k], b0[k], alpha);
         }
         #pragma unroll
-        for(int k = 0; k < kComputeVectorUnroll; ++k) {
-            dst_v[base + k * block_stride] = a[k];
+        for(int k = 0; k < kPipelineStage; ++k) {
+            dst_v[base + k * block_stride] = a0[k];
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            triad_vector(a1[k], b1[k], alpha);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            dst_v[base + (k + kPipelineStage) * block_stride] = a1[k];
         }
     }
     for(; base < vec_count; base += block_stride) {
@@ -226,7 +270,8 @@ double run_kernel(const Args& args) {
     // per-thread work chunk so small that loop overhead dominates.
     constexpr std::size_t vec_bytes = 16;
     const std::size_t vec_count = data_bytes / vec_bytes;
-    const int max_blocks = std::max(1, props.multiProcessorCount * 16);
+    const int blocks_per_cu = std::max(1, args.blocks_per_cu);
+    const int max_blocks = std::max(1, props.multiProcessorCount * blocks_per_cu);
     const int blocks_by_work = static_cast<int>(std::min<std::size_t>(
         static_cast<std::size_t>(max_blocks),
         std::max<std::size_t>(1, (vec_count + static_cast<std::size_t>(threads) - 1)

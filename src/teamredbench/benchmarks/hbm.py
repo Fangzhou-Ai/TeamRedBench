@@ -92,26 +92,28 @@ class HbmBandwidthBenchmark(Benchmark):
                     "size_mib": size_mib,
                     "elements": numel,
                 }
+                kernel_args = [
+                    "--dtype",
+                    spec.name,
+                    "--mode",
+                    mode,
+                    "--size-mib",
+                    str(size_mib),
+                    "--warmup",
+                    str(warmup),
+                    "--iterations",
+                    str(iterations),
+                    "--device-id",
+                    str(self.context.device_id),
+                    "--scale",
+                    str(scale),
+                ]
+                blocks_per_cu = self.params.get("blocks_per_cu")
+                if blocks_per_cu is not None:
+                    kernel_args += ["--blocks-per-cu", str(int(blocks_per_cu))]
+                    metadata["blocks_per_cu"] = int(blocks_per_cu)
                 try:
-                    result = run_native_kernel(
-                        kernel,
-                        [
-                            "--dtype",
-                            spec.name,
-                            "--mode",
-                            mode,
-                            "--size-mib",
-                            str(size_mib),
-                            "--warmup",
-                            str(warmup),
-                            "--iterations",
-                            str(iterations),
-                            "--device-id",
-                            str(self.context.device_id),
-                            "--scale",
-                            str(scale),
-                        ],
-                    )
+                    result = run_native_kernel(kernel, kernel_args)
                 except NativeKernelError as exc:
                     records.append(
                         self.emit_record(
