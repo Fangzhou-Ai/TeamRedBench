@@ -13,6 +13,73 @@
 
 namespace {
 
+using Vec16 = int __attribute__((ext_vector_type(4)));
+
+template <typename T>
+struct KernelTuning {
+    static constexpr int kThreadsPerBlock = 512;
+    static constexpr int kScaleVectorUnroll = 16;
+    static constexpr int kTriadVectorUnroll = 16;
+    static constexpr int kScaleBlocksPerCu = 16;
+    static constexpr int kTriadBlocksPerCu = 16;
+};
+
+template <>
+struct KernelTuning<__half> {
+    static constexpr int kThreadsPerBlock = 512;
+    static constexpr int kScaleVectorUnroll = 16;
+    static constexpr int kTriadVectorUnroll = 16;
+    static constexpr int kScaleBlocksPerCu = 8;
+    static constexpr int kTriadBlocksPerCu = 24;
+};
+
+template <>
+struct KernelTuning<hip_bfloat16> {
+    static constexpr int kThreadsPerBlock = 512;
+    static constexpr int kScaleVectorUnroll = 16;
+    static constexpr int kTriadVectorUnroll = 16;
+    static constexpr int kScaleBlocksPerCu = 48;
+    static constexpr int kTriadBlocksPerCu = 32;
+};
+
+template <>
+struct KernelTuning<float> {
+    static constexpr int kThreadsPerBlock = 512;
+    static constexpr int kScaleVectorUnroll = 16;
+    static constexpr int kTriadVectorUnroll = 16;
+    static constexpr int kScaleBlocksPerCu = 16;
+    static constexpr int kTriadBlocksPerCu = 8;
+};
+
+template <>
+struct KernelTuning<double> {
+    static constexpr int kThreadsPerBlock = 512;
+    static constexpr int kScaleVectorUnroll = 16;
+    static constexpr int kTriadVectorUnroll = 16;
+    static constexpr int kScaleBlocksPerCu = 8;
+    static constexpr int kTriadBlocksPerCu = 14;
+};
+
+template <>
+struct KernelTuning<std::int8_t> {
+    static constexpr int kThreadsPerBlock = 512;
+    static constexpr int kScaleVectorUnroll = 16;
+    static constexpr int kTriadVectorUnroll = 16;
+    static constexpr int kScaleBlocksPerCu = 16;
+    static constexpr int kTriadBlocksPerCu = 16;
+};
+
+__device__ __forceinline__ Vec16 nt_load(const Vec16* __restrict__ p) {
+    // Streaming loads: the working set (>=1 GiB) dwarfs L2, so bypassing the
+    // cache with a nontemporal load frees L2 bandwidth for address/metadata
+    // traffic and measurably lifts sustained HBM read BW on CDNA.
+    return __builtin_nontemporal_load(p);
+}
+
+__device__ __forceinline__ void nt_store(Vec16* __restrict__ p, const Vec16& value) {
+    __builtin_nontemporal_store(value, p);
+}
+
 struct Args {
     std::string dtype = "float32";
     std::string mode = "copy";
@@ -21,7 +88,38 @@ struct Args {
     int iterations = 50;
     int device_id = 0;
     double scale = 1.0;
+    int blocks_per_cu = 0;
 };
+
+template <typename T>
+int default_blocks_per_cu_for_mode(const std::string& mode) {
+    if(mode == "scale") {
+        return KernelTuning<T>::kScaleBlocksPerCu;
+    }
+    if(mode == "triad") {
+        return KernelTuning<T>::kTriadBlocksPerCu;
+    }
+    return 16;
+}
+
+template <typename T>
+int resolve_blocks_per_cu(const Args& args) {
+    if(args.blocks_per_cu > 0) {
+        return args.blocks_per_cu;
+    }
+    return default_blocks_per_cu_for_mode<T>(args.mode);
+}
+
+template <typename T>
+int vector_unroll_for_mode(const std::string& mode) {
+    if(mode == "scale") {
+        return KernelTuning<T>::kScaleVectorUnroll;
+    }
+    if(mode == "triad") {
+        return KernelTuning<T>::kTriadVectorUnroll;
+    }
+    return 0;
+}
 
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
@@ -57,6 +155,8 @@ Args parse_args(int argc, char** argv) {
             args.device_id = std::stoi(value);
         } else if(key == "--scale") {
             args.scale = std::stod(value);
+        } else if(key == "--blocks-per-cu") {
+            args.blocks_per_cu = std::stoi(value);
         } else {
             fail("unknown argument " + key);
         }
@@ -65,20 +165,158 @@ Args parse_args(int argc, char** argv) {
 }
 
 template <typename T>
-__global__ void scale_kernel(const T* src, T* dst, T alpha, std::size_t count) {
-    std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
-    for(; index < count; index += stride) {
-        dst[index] = src[index] * alpha;
+__device__ __forceinline__ void scale_vector(Vec16& raw, T alpha) {
+    constexpr std::size_t vec_width = sizeof(Vec16) / sizeof(T);
+    T* lane = reinterpret_cast<T*>(&raw);
+    #pragma unroll
+    for(std::size_t k = 0; k < vec_width; ++k) {
+        lane[k] = lane[k] * alpha;
     }
 }
 
 template <typename T>
-__global__ void triad_kernel(const T* src, T* aux, T* dst, T alpha, std::size_t count) {
-    std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
-    for(; index < count; index += stride) {
-        dst[index] = src[index] + aux[index] * alpha;
+__device__ __forceinline__ void triad_vector(Vec16& a, const Vec16& b, T alpha) {
+    constexpr std::size_t vec_width = sizeof(Vec16) / sizeof(T);
+    T* a_lane = reinterpret_cast<T*>(&a);
+    const T* b_lane = reinterpret_cast<const T*>(&b);
+    #pragma unroll
+    for(std::size_t k = 0; k < vec_width; ++k) {
+        a_lane[k] = a_lane[k] + b_lane[k] * alpha;
+    }
+}
+
+template <typename T, int ThreadsPerBlock = KernelTuning<T>::kThreadsPerBlock>
+__global__ __launch_bounds__(ThreadsPerBlock) void scale_kernel(
+    const T* __restrict__ src, T* __restrict__ dst, T alpha, std::size_t count) {
+    constexpr int kVectorUnroll = KernelTuning<T>::kScaleVectorUnroll;
+    static_assert(kVectorUnroll % 2 == 0, "double-buffered pipeline requires even unroll");
+    constexpr int kPipelineStage = kVectorUnroll / 2;
+    constexpr std::size_t vec_width = sizeof(Vec16) / sizeof(T);
+
+    const std::size_t vec_count = count / vec_width;
+    const Vec16* __restrict__ src_v = reinterpret_cast<const Vec16*>(src);
+    Vec16* __restrict__ dst_v = reinterpret_cast<Vec16*>(dst);
+
+    // Block-chunk pattern: each block processes a contiguous kVectorUnroll*blockDim
+    // chunk of vectors so a wave's unrolled loads hit consecutive HBM rows (better row-
+    // buffer locality than grid-stride with millions of elements between unrolled loads).
+    const std::size_t block_chunk = static_cast<std::size_t>(blockDim.x) * kVectorUnroll;
+    const std::size_t grid_chunk = static_cast<std::size_t>(gridDim.x) * block_chunk;
+    const std::size_t block_stride = blockDim.x;
+
+    std::size_t base = static_cast<std::size_t>(blockIdx.x) * block_chunk + threadIdx.x;
+    for(; base + (kVectorUnroll - 1) * block_stride < vec_count; base += grid_chunk) {
+        // Two-stage software pipeline: issue second-half loads while the first
+        // half is still in flight/being computed, then overlap first-half
+        // stores with second-half compute. Gives the scheduler strictly more
+        // independent work across the load/compute/store phases.
+        Vec16 r0[kPipelineStage];
+        Vec16 r1[kPipelineStage];
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            r0[k] = nt_load(&src_v[base + k * block_stride]);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            r1[k] = nt_load(&src_v[base + (k + kPipelineStage) * block_stride]);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            scale_vector(r0[k], alpha);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            nt_store(&dst_v[base + k * block_stride], r0[k]);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            scale_vector(r1[k], alpha);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            nt_store(&dst_v[base + (k + kPipelineStage) * block_stride], r1[k]);
+        }
+    }
+    for(; base < vec_count; base += block_stride) {
+        Vec16 raw = src_v[base];
+        scale_vector(raw, alpha);
+        nt_store(&dst_v[base], raw);
+    }
+
+    const std::size_t tail_base = vec_count * vec_width;
+    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t grid_threads = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for(std::size_t j = tail_base + tid; j < count; j += grid_threads) {
+        dst[j] = src[j] * alpha;
+    }
+}
+
+template <typename T, int ThreadsPerBlock = KernelTuning<T>::kThreadsPerBlock>
+__global__ __launch_bounds__(ThreadsPerBlock) void triad_kernel(
+    const T* __restrict__ src, const T* __restrict__ aux, T* __restrict__ dst,
+    T alpha, std::size_t count) {
+    constexpr int kVectorUnroll = KernelTuning<T>::kTriadVectorUnroll;
+    static_assert(kVectorUnroll % 2 == 0, "double-buffered pipeline requires even unroll");
+    constexpr int kPipelineStage = kVectorUnroll / 2;
+    constexpr std::size_t vec_width = sizeof(Vec16) / sizeof(T);
+
+    const std::size_t vec_count = count / vec_width;
+    const Vec16* __restrict__ src_v = reinterpret_cast<const Vec16*>(src);
+    const Vec16* __restrict__ aux_v = reinterpret_cast<const Vec16*>(aux);
+    Vec16* __restrict__ dst_v = reinterpret_cast<Vec16*>(dst);
+
+    const std::size_t block_chunk = static_cast<std::size_t>(blockDim.x) * kVectorUnroll;
+    const std::size_t grid_chunk = static_cast<std::size_t>(gridDim.x) * block_chunk;
+    const std::size_t block_stride = blockDim.x;
+
+    std::size_t base = static_cast<std::size_t>(blockIdx.x) * block_chunk + threadIdx.x;
+    for(; base + (kVectorUnroll - 1) * block_stride < vec_count; base += grid_chunk) {
+        // Two-stage pipeline with src/aux interleaved within each stage: the
+        // HBM controller sees requests on both input buffers early, and the
+        // second-half loads issue while the first half is computing/storing.
+        Vec16 a0[kPipelineStage];
+        Vec16 b0[kPipelineStage];
+        Vec16 a1[kPipelineStage];
+        Vec16 b1[kPipelineStage];
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            a0[k] = nt_load(&src_v[base + k * block_stride]);
+            b0[k] = nt_load(&aux_v[base + k * block_stride]);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            a1[k] = nt_load(&src_v[base + (k + kPipelineStage) * block_stride]);
+            b1[k] = nt_load(&aux_v[base + (k + kPipelineStage) * block_stride]);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            triad_vector(a0[k], b0[k], alpha);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            nt_store(&dst_v[base + k * block_stride], a0[k]);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            triad_vector(a1[k], b1[k], alpha);
+        }
+        #pragma unroll
+        for(int k = 0; k < kPipelineStage; ++k) {
+            nt_store(&dst_v[base + (k + kPipelineStage) * block_stride], a1[k]);
+        }
+    }
+    for(; base < vec_count; base += block_stride) {
+        Vec16 a = src_v[base];
+        const Vec16 b = aux_v[base];
+        triad_vector(a, b, alpha);
+        nt_store(&dst_v[base], a);
+    }
+
+    const std::size_t tail_base = vec_count * vec_width;
+    const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t grid_threads = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for(std::size_t j = tail_base + tid; j < count; j += grid_threads) {
+        dst[j] = src[j] + aux[j] * alpha;
     }
 }
 
@@ -116,12 +354,19 @@ double run_kernel(const Args& args) {
     check_hip(hipEventCreate(&start), "hipEventCreate(start)");
     check_hip(hipEventCreate(&stop), "hipEventCreate(stop)");
 
-    const int threads = 256;
-    const int max_blocks = std::max(1, props.multiProcessorCount * 8);
-    const int blocks = std::min<int>(
-        max_blocks,
-        static_cast<int>((count + static_cast<std::size_t>(threads) - 1) / static_cast<std::size_t>(threads))
-    );
+    const int threads = KernelTuning<T>::kThreadsPerBlock;
+    // A wide grid keeps multiple wavefronts per CU queued without pushing the
+    // per-thread work chunk so small that loop overhead dominates.
+    constexpr std::size_t vec_bytes = 16;
+    const std::size_t vec_count = data_bytes / vec_bytes;
+    const int blocks_per_cu = std::max(1, resolve_blocks_per_cu<T>(args));
+    const int max_blocks = std::max(1, props.multiProcessorCount * blocks_per_cu);
+    const int blocks_by_work = static_cast<int>(std::min<std::size_t>(
+        static_cast<std::size_t>(max_blocks),
+        std::max<std::size_t>(1, (vec_count + static_cast<std::size_t>(threads) - 1)
+                                 / static_cast<std::size_t>(threads))
+    ));
+    const int blocks = std::max(1, blocks_by_work);
     const T alpha = static_cast<T>(args.scale);
 
     auto launch_once = [&]() {
@@ -184,7 +429,11 @@ template <typename T>
 int emit_success(const Args& args) {
     const double elapsed_s = run_kernel<T>(args);
     std::cout << "{\"status\":\"ok\",\"raw_metrics\":{\"elapsed_s\":" << elapsed_s
-              << "},\"metadata\":{\"implementation\":\"hip\"}}" << std::endl;
+              << "},\"metadata\":{\"implementation\":\"hip\""
+              << ",\"threads_per_block\":" << KernelTuning<T>::kThreadsPerBlock
+              << ",\"vector_unroll\":" << vector_unroll_for_mode<T>(args.mode)
+              << ",\"blocks_per_cu\":" << resolve_blocks_per_cu<T>(args)
+              << "}}" << std::endl;
     return 0;
 }
 
