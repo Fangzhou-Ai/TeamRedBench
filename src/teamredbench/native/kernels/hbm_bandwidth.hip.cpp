@@ -27,6 +27,10 @@ __device__ __forceinline__ Vec16 nt_load(const Vec16* __restrict__ p) {
     return __builtin_nontemporal_load(p);
 }
 
+__device__ __forceinline__ void nt_store(Vec16* __restrict__ p, const Vec16& value) {
+    __builtin_nontemporal_store(value, p);
+}
+
 struct Args {
     std::string dtype = "float32";
     std::string mode = "copy";
@@ -140,7 +144,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void scale_kernel(
         }
         #pragma unroll
         for(int k = 0; k < kPipelineStage; ++k) {
-            dst_v[base + k * block_stride] = r0[k];
+            nt_store(&dst_v[base + k * block_stride], r0[k]);
         }
         #pragma unroll
         for(int k = 0; k < kPipelineStage; ++k) {
@@ -148,13 +152,13 @@ __global__ __launch_bounds__(kThreadsPerBlock) void scale_kernel(
         }
         #pragma unroll
         for(int k = 0; k < kPipelineStage; ++k) {
-            dst_v[base + (k + kPipelineStage) * block_stride] = r1[k];
+            nt_store(&dst_v[base + (k + kPipelineStage) * block_stride], r1[k]);
         }
     }
     for(; base < vec_count; base += block_stride) {
         Vec16 raw = src_v[base];
         scale_vector(raw, alpha);
-        dst_v[base] = raw;
+        nt_store(&dst_v[base], raw);
     }
 
     const std::size_t tail_base = vec_count * vec_width;
@@ -205,7 +209,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void triad_kernel(
         }
         #pragma unroll
         for(int k = 0; k < kPipelineStage; ++k) {
-            dst_v[base + k * block_stride] = a0[k];
+            nt_store(&dst_v[base + k * block_stride], a0[k]);
         }
         #pragma unroll
         for(int k = 0; k < kPipelineStage; ++k) {
@@ -213,14 +217,14 @@ __global__ __launch_bounds__(kThreadsPerBlock) void triad_kernel(
         }
         #pragma unroll
         for(int k = 0; k < kPipelineStage; ++k) {
-            dst_v[base + (k + kPipelineStage) * block_stride] = a1[k];
+            nt_store(&dst_v[base + (k + kPipelineStage) * block_stride], a1[k]);
         }
     }
     for(; base < vec_count; base += block_stride) {
         Vec16 a = src_v[base];
         const Vec16 b = aux_v[base];
         triad_vector(a, b, alpha);
-        dst_v[base] = a;
+        nt_store(&dst_v[base], a);
     }
 
     const std::size_t tail_base = vec_count * vec_width;
