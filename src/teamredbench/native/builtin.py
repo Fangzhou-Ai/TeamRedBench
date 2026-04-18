@@ -18,7 +18,6 @@ register_native_kernel(
 register_native_kernel(
     name="mfu_hipblas",
     benchmark="mfu",
-    description="hipBLAS GEMM kernel for MFU measurements.",
+    description="Tiled HIP GEMM kernel for MFU measurements.",
     source_path=KERNEL_DIR / "mfu_gemm.hip.cpp",
-    compile_args=("-lhipblas",),
 )
