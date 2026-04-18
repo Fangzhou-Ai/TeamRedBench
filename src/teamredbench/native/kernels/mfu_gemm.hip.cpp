@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <iostream>
 #include <sstream>
@@ -29,7 +30,9 @@ struct KernelTuning {
     static constexpr int kMfmaWaveGridN = 2;
     static constexpr int kMfmaWaveTileM = 2;
     static constexpr int kMfmaWaveTileN = 2;
-    static constexpr int kMfmaBlocksPerCu = 8;
+    static constexpr int kMfmaKStages = 2;
+    static constexpr int kMfmaBlocksPerCu = 4;
+    static constexpr int kMfmaTileGroupM = 8;
 };
 
 template <>
@@ -41,14 +44,22 @@ struct KernelTuning<rocwmma::float16_t> {
     static constexpr int kScalarBlockTileK = 16;
     static constexpr int kScalarBlocksPerCu = 8;
 
+    // gfx950 exposes v_mfma_f32_16x16x32_f16 which packs twice the K per MFMA
+    // versus the older 16x16x16 variant. FragK=32 doubles MFMA throughput on
+    // MI350X. WaveTile 8x4 gives 32 MFMAs between LDS-load batches, letting
+    // the matrix pipe run back-to-back while the global prefetch of the next
+    // K-tile completes. BlockTileK = 32 (KStages=1) keeps double-buffered LDS
+    // well under the 64 KiB limit (48 KiB total) so 2 blocks can co-reside.
     static constexpr int kFragM = 16;
     static constexpr int kFragN = 16;
-    static constexpr int kFragK = 16;
+    static constexpr int kFragK = 32;
     static constexpr int kMfmaWaveGridM = 2;
     static constexpr int kMfmaWaveGridN = 2;
-    static constexpr int kMfmaWaveTileM = 4;
-    static constexpr int kMfmaWaveTileN = 2;
-    static constexpr int kMfmaBlocksPerCu = 8;
+    static constexpr int kMfmaWaveTileM = 8;
+    static constexpr int kMfmaWaveTileN = 4;
+    static constexpr int kMfmaKStages = 1;          // BlockTileK = 32
+    static constexpr int kMfmaBlocksPerCu = 2;
+    static constexpr int kMfmaTileGroupM = 8;
 };
 
 template <>
@@ -62,12 +73,14 @@ struct KernelTuning<rocwmma::bfloat16_t> {
 
     static constexpr int kFragM = 16;
     static constexpr int kFragN = 16;
-    static constexpr int kFragK = 16;
+    static constexpr int kFragK = 32;
     static constexpr int kMfmaWaveGridM = 2;
     static constexpr int kMfmaWaveGridN = 2;
-    static constexpr int kMfmaWaveTileM = 4;
-    static constexpr int kMfmaWaveTileN = 2;
-    static constexpr int kMfmaBlocksPerCu = 6;
+    static constexpr int kMfmaWaveTileM = 8;
+    static constexpr int kMfmaWaveTileN = 4;
+    static constexpr int kMfmaKStages = 1;
+    static constexpr int kMfmaBlocksPerCu = 2;
+    static constexpr int kMfmaTileGroupM = 8;
 };
 
 template <>
@@ -84,9 +97,11 @@ struct KernelTuning<float> {
     static constexpr int kFragK = 16;
     static constexpr int kMfmaWaveGridM = 2;
     static constexpr int kMfmaWaveGridN = 2;
-    static constexpr int kMfmaWaveTileM = 2;
-    static constexpr int kMfmaWaveTileN = 2;
-    static constexpr int kMfmaBlocksPerCu = 16;
+    static constexpr int kMfmaWaveTileM = 4;
+    static constexpr int kMfmaWaveTileN = 4;
+    static constexpr int kMfmaKStages = 2;          // BlockTileK = 32
+    static constexpr int kMfmaBlocksPerCu = 2;
+    static constexpr int kMfmaTileGroupM = 8;
 };
 
 template <>
@@ -105,7 +120,9 @@ struct KernelTuning<double> {
     static constexpr int kMfmaWaveGridN = 2;
     static constexpr int kMfmaWaveTileM = 2;
     static constexpr int kMfmaWaveTileN = 2;
-    static constexpr int kMfmaBlocksPerCu = 12;
+    static constexpr int kMfmaKStages = 2;          // BlockTileK = 8
+    static constexpr int kMfmaBlocksPerCu = 2;
+    static constexpr int kMfmaTileGroupM = 8;
 };
 
 template <typename T>
@@ -154,6 +171,11 @@ constexpr int mfma_block_tile_m() {
 template <typename T>
 constexpr int mfma_block_tile_n() {
     return KernelTuning<T>::kFragN * KernelTuning<T>::kMfmaWaveGridN * KernelTuning<T>::kMfmaWaveTileN;
+}
+
+template <typename T>
+constexpr int mfma_block_tile_k() {
+    return KernelTuning<T>::kFragK * KernelTuning<T>::kMfmaKStages;
 }
 
 struct Args {
@@ -373,6 +395,18 @@ __global__ __launch_bounds__(ThreadsX * ThreadsY) void scalar_gemm_kernel(
     }
 }
 
+// Optimized MFMA GEMM kernel.
+//   * Block tile is FragM * WaveGridM * WaveTileM  x  FragN * WaveGridN * WaveTileN
+//     (e.g. 128x128 for fp16/bf16/fp32 with WaveTile=4x4, WaveGrid=2x2).
+//   * BlockTileK = FragK * KStages so each outer K iteration drives multiple MFMAs
+//     from one LDS fill (KStages > 1 amortises __syncthreads cost).
+//   * Global -> LDS loads use 16-byte vector transfers (uint4) which map to
+//     buffer_load_dwordx4 on CDNA3 and saturate the HBM path.
+//   * LDS is double-buffered so the next K-tile is fetched while the current
+//     MFMAs run; ds_reads inside mma_sync can overlap global_loads of the next
+//     stage.
+//   * Tile scheduling is swizzled in groups of TileGroupM rows so neighbouring
+//     blocks share B columns in L2.
 template <
     typename T,
     int FragM = KernelTuning<T>::kFragM,
@@ -381,7 +415,9 @@ template <
     int WaveGridM = KernelTuning<T>::kMfmaWaveGridM,
     int WaveGridN = KernelTuning<T>::kMfmaWaveGridN,
     int WaveTileM = KernelTuning<T>::kMfmaWaveTileM,
-    int WaveTileN = KernelTuning<T>::kMfmaWaveTileN>
+    int WaveTileN = KernelTuning<T>::kMfmaWaveTileN,
+    int KStages = KernelTuning<T>::kMfmaKStages,
+    int TileGroupM = KernelTuning<T>::kMfmaTileGroupM>
 __global__ __launch_bounds__(64 * WaveGridM * WaveGridN) void mfma_gemm_kernel(
     const T* __restrict__ a,
     const T* __restrict__ b,
@@ -397,23 +433,106 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN) void mfma_gemm_kernel(
     constexpr int kThreadsPerBlock = 64 * WaveGridM * WaveGridN;
     constexpr int kBlockTileM = FragM * WaveGridM * WaveTileM;
     constexpr int kBlockTileN = FragN * WaveGridN * WaveTileN;
+    constexpr int kBlockTileK = FragK * KStages;
     static_assert(kThreadsPerBlock <= 1024, "MFMA kernel exceeds max threads per block");
 
-    __shared__ T a_tile[kBlockTileM * FragK];
-    __shared__ T b_tile[FragK * kBlockTileN];
+    constexpr int kVecBytes = 16;
+    constexpr int kVecElems = kVecBytes / static_cast<int>(sizeof(T));
+    static_assert(kVecElems >= 1, "Vector element count must be >= 1");
+    static_assert(kBlockTileK % kVecElems == 0, "BlockTileK must be divisible by vector elements");
+    static_assert(kBlockTileN % kVecElems == 0, "BlockTileN must be divisible by vector elements");
+
+    constexpr int kAVecsPerRow = kBlockTileK / kVecElems;
+    constexpr int kBVecsPerRow = kBlockTileN / kVecElems;
+    constexpr int kATotalVecs = kBlockTileM * kAVecsPerRow;
+    constexpr int kBTotalVecs = kBlockTileK * kBVecsPerRow;
+
+    __shared__ T a_tile[2][kBlockTileM * kBlockTileK];
+    __shared__ T b_tile[2][kBlockTileK * kBlockTileN];
 
     const int linear_tid = static_cast<int>(threadIdx.x);
     const int wave_id = linear_tid / 64;
     const int wave_row = wave_id / WaveGridN;
     const int wave_col = wave_id % WaveGridN;
 
-    const int tiles_n = n / kBlockTileN;
     const int tiles_m = m / kBlockTileM;
+    const int tiles_n = n / kBlockTileN;
     const int total_tiles = tiles_m * tiles_n;
 
+    auto vec_load_a = [&](int buf, int k_base, int row_base) {
+        #pragma unroll 1
+        for(int vi = linear_tid; vi < kATotalVecs; vi += kThreadsPerBlock) {
+            const int row_in_tile = vi / kAVecsPerRow;
+            const int vec_in_row = vi % kAVecsPerRow;
+            const int global_row = row_base + row_in_tile;
+            const int global_k = k_base + vec_in_row * kVecElems;
+            const uint4 v = *reinterpret_cast<const uint4*>(
+                a + static_cast<std::size_t>(global_row) * static_cast<std::size_t>(k)
+                  + static_cast<std::size_t>(global_k));
+            *reinterpret_cast<uint4*>(
+                &a_tile[buf][row_in_tile * kBlockTileK + vec_in_row * kVecElems]) = v;
+        }
+    };
+
+    auto vec_load_b = [&](int buf, int k_base, int col_base) {
+        #pragma unroll 1
+        for(int vi = linear_tid; vi < kBTotalVecs; vi += kThreadsPerBlock) {
+            const int row_in_tile = vi / kBVecsPerRow;
+            const int vec_in_row = vi % kBVecsPerRow;
+            const int global_k = k_base + row_in_tile;
+            const int global_col = col_base + vec_in_row * kVecElems;
+            const uint4 v = *reinterpret_cast<const uint4*>(
+                b + static_cast<std::size_t>(global_k) * static_cast<std::size_t>(n)
+                  + static_cast<std::size_t>(global_col));
+            *reinterpret_cast<uint4*>(
+                &b_tile[buf][row_in_tile * kBlockTileN + vec_in_row * kVecElems]) = v;
+        }
+    };
+
+    auto compute_stage = [&](int buf, FragC accum[WaveTileM][WaveTileN]) {
+        #pragma unroll
+        for(int ks = 0; ks < KStages; ++ks) {
+            FragA a_frag[WaveTileM];
+            FragB b_frag[WaveTileN];
+
+            #pragma unroll
+            for(int i = 0; i < WaveTileM; ++i) {
+                const int a_row = (wave_row * WaveTileM + i) * FragM;
+                rocwmma::load_matrix_sync(
+                    a_frag[i],
+                    &a_tile[buf][a_row * kBlockTileK + ks * FragK],
+                    kBlockTileK);
+            }
+            #pragma unroll
+            for(int j = 0; j < WaveTileN; ++j) {
+                const int b_col = (wave_col * WaveTileN + j) * FragN;
+                rocwmma::load_matrix_sync(
+                    b_frag[j],
+                    &b_tile[buf][ks * FragK * kBlockTileN + b_col],
+                    kBlockTileN);
+            }
+            #pragma unroll
+            for(int i = 0; i < WaveTileM; ++i) {
+                #pragma unroll
+                for(int j = 0; j < WaveTileN; ++j) {
+                    rocwmma::mma_sync(accum[i][j], a_frag[i], b_frag[j], accum[i][j]);
+                }
+            }
+        }
+    };
+
     for(int tile_linear = static_cast<int>(blockIdx.x); tile_linear < total_tiles; tile_linear += static_cast<int>(gridDim.x)) {
-        const int tile_row = tile_linear / tiles_n;
-        const int tile_col = tile_linear % tiles_n;
+        // Grouped-column swizzle: visit TileGroupM tile-rows at a time so neighbouring
+        // blocks share the B column tile in L2.
+        const int group_stride = TileGroupM * tiles_n;
+        const int group_id = tile_linear / group_stride;
+        const int first_tile_m = group_id * TileGroupM;
+        const int group_rows = (first_tile_m + TileGroupM <= tiles_m)
+            ? TileGroupM
+            : (tiles_m - first_tile_m);
+        const int tile_in_group = tile_linear % group_stride;
+        const int tile_row = first_tile_m + (tile_in_group % group_rows);
+        const int tile_col = tile_in_group / group_rows;
         const int row_base = tile_row * kBlockTileM;
         const int col_base = tile_col * kBlockTileN;
 
@@ -426,44 +545,29 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN) void mfma_gemm_kernel(
             }
         }
 
-        for(int k_base = 0; k_base < k; k_base += FragK) {
-            for(int index = linear_tid; index < kBlockTileM * FragK; index += kThreadsPerBlock) {
-                const int tile_row_offset = index / FragK;
-                const int tile_k_offset = index % FragK;
-                a_tile[index] = a[static_cast<std::size_t>(row_base + tile_row_offset) * static_cast<std::size_t>(k)
-                                  + static_cast<std::size_t>(k_base + tile_k_offset)];
-            }
-            for(int index = linear_tid; index < FragK * kBlockTileN; index += kThreadsPerBlock) {
-                const int tile_k_offset = index / kBlockTileN;
-                const int tile_col_offset = index % kBlockTileN;
-                b_tile[index] = b[static_cast<std::size_t>(k_base + tile_k_offset) * static_cast<std::size_t>(n)
-                                  + static_cast<std::size_t>(col_base + tile_col_offset)];
-            }
+        int buf = 0;
+        // Prologue: load the first K-tile into buf 0.
+        vec_load_a(buf, 0, row_base);
+        vec_load_b(buf, 0, col_base);
+        __syncthreads();
+
+        // Main pipelined loop: while computing on buf, prefetch next tile into the
+        // other buffer. Requires a __syncthreads after both compute and fill to
+        // keep the buffers consistent across waves.
+        for(int k_base = 0; k_base + kBlockTileK < k; k_base += kBlockTileK) {
+            const int next_buf = buf ^ 1;
+            const int next_k_base = k_base + kBlockTileK;
+
+            vec_load_a(next_buf, next_k_base, row_base);
+            vec_load_b(next_buf, next_k_base, col_base);
+            compute_stage(buf, accum);
             __syncthreads();
-
-            FragA a_frag[WaveTileM];
-            FragB b_frag[WaveTileN];
-
-            #pragma unroll
-            for(int i = 0; i < WaveTileM; ++i) {
-                const int a_row = (wave_row * WaveTileM + i) * FragM;
-                rocwmma::load_matrix_sync(a_frag[i], &a_tile[a_row * FragK], FragK);
-            }
-            #pragma unroll
-            for(int j = 0; j < WaveTileN; ++j) {
-                const int b_col = (wave_col * WaveTileN + j) * FragN;
-                rocwmma::load_matrix_sync(b_frag[j], &b_tile[b_col], kBlockTileN);
-            }
-
-            #pragma unroll
-            for(int i = 0; i < WaveTileM; ++i) {
-                #pragma unroll
-                for(int j = 0; j < WaveTileN; ++j) {
-                    rocwmma::mma_sync(accum[i][j], a_frag[i], b_frag[j], accum[i][j]);
-                }
-            }
-            __syncthreads();
+            buf = next_buf;
         }
+
+        // Epilogue: compute on the final loaded buffer.
+        compute_stage(buf, accum);
+        __syncthreads();
 
         #pragma unroll
         for(int i = 0; i < WaveTileM; ++i) {
@@ -487,7 +591,7 @@ template <typename T>
 bool can_use_mfma(const Args& args) {
     return (args.m % mfma_block_tile_m<T>() == 0)
         && (args.n % mfma_block_tile_n<T>() == 0)
-        && (args.k % KernelTuning<T>::kFragK == 0);
+        && (args.k % mfma_block_tile_k<T>() == 0);
 }
 
 template <typename T>
@@ -626,7 +730,7 @@ int emit_success(const Args& args) {
               << "\",\"threads_per_block\":" << (used_mfma ? mfma_threads_per_block<T>() : scalar_threads_per_block<T>())
               << ",\"tile_m\":" << (used_mfma ? mfma_block_tile_m<T>() : scalar_block_tile_m<T>())
               << ",\"tile_n\":" << (used_mfma ? mfma_block_tile_n<T>() : scalar_block_tile_n<T>())
-              << ",\"tile_k\":" << (used_mfma ? KernelTuning<T>::kFragK : KernelTuning<T>::kScalarBlockTileK)
+              << ",\"tile_k\":" << (used_mfma ? mfma_block_tile_k<T>() : KernelTuning<T>::kScalarBlockTileK)
               << ",\"blocks_per_cu\":"
               << (used_mfma ? resolve_mfma_blocks_per_cu<T>(args) : resolve_scalar_blocks_per_cu<T>(args));
     if(used_mfma) {
@@ -636,7 +740,9 @@ int emit_success(const Args& args) {
                   << ",\"wave_tile_n\":" << KernelTuning<T>::kMfmaWaveTileN
                   << ",\"frag_m\":" << KernelTuning<T>::kFragM
                   << ",\"frag_n\":" << KernelTuning<T>::kFragN
-                  << ",\"frag_k\":" << KernelTuning<T>::kFragK;
+                  << ",\"frag_k\":" << KernelTuning<T>::kFragK
+                  << ",\"k_stages\":" << KernelTuning<T>::kMfmaKStages
+                  << ",\"tile_group_m\":" << KernelTuning<T>::kMfmaTileGroupM;
     } else {
         std::cout << ",\"thread_tile_m\":" << KernelTuning<T>::kThreadTileM
                   << ",\"thread_tile_n\":" << KernelTuning<T>::kThreadTileN;
