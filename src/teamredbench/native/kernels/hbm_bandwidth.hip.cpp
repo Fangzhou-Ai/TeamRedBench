@@ -13,12 +13,61 @@
 
 namespace {
 
-constexpr int kThreadsPerBlock = 512;
-constexpr int kComputeVectorUnroll = 16;
-static_assert(kComputeVectorUnroll % 2 == 0, "double-buffered pipeline requires even unroll");
-constexpr int kPipelineStage = kComputeVectorUnroll / 2;
-
 using Vec16 = int __attribute__((ext_vector_type(4)));
+
+template <typename T>
+struct KernelTuning {
+    static constexpr int kThreadsPerBlock = 512;
+    static constexpr int kScaleVectorUnroll = 16;
+    static constexpr int kTriadVectorUnroll = 16;
+    static constexpr int kScaleBlocksPerCu = 16;
+    static constexpr int kTriadBlocksPerCu = 16;
+};
+
+template <>
+struct KernelTuning<__half> {
+    static constexpr int kThreadsPerBlock = 512;
+    static constexpr int kScaleVectorUnroll = 16;
+    static constexpr int kTriadVectorUnroll = 16;
+    static constexpr int kScaleBlocksPerCu = 8;
+    static constexpr int kTriadBlocksPerCu = 24;
+};
+
+template <>
+struct KernelTuning<hip_bfloat16> {
+    static constexpr int kThreadsPerBlock = 512;
+    static constexpr int kScaleVectorUnroll = 16;
+    static constexpr int kTriadVectorUnroll = 16;
+    static constexpr int kScaleBlocksPerCu = 48;
+    static constexpr int kTriadBlocksPerCu = 32;
+};
+
+template <>
+struct KernelTuning<float> {
+    static constexpr int kThreadsPerBlock = 512;
+    static constexpr int kScaleVectorUnroll = 16;
+    static constexpr int kTriadVectorUnroll = 16;
+    static constexpr int kScaleBlocksPerCu = 16;
+    static constexpr int kTriadBlocksPerCu = 8;
+};
+
+template <>
+struct KernelTuning<double> {
+    static constexpr int kThreadsPerBlock = 512;
+    static constexpr int kScaleVectorUnroll = 16;
+    static constexpr int kTriadVectorUnroll = 16;
+    static constexpr int kScaleBlocksPerCu = 8;
+    static constexpr int kTriadBlocksPerCu = 14;
+};
+
+template <>
+struct KernelTuning<std::int8_t> {
+    static constexpr int kThreadsPerBlock = 512;
+    static constexpr int kScaleVectorUnroll = 16;
+    static constexpr int kTriadVectorUnroll = 16;
+    static constexpr int kScaleBlocksPerCu = 16;
+    static constexpr int kTriadBlocksPerCu = 16;
+};
 
 __device__ __forceinline__ Vec16 nt_load(const Vec16* __restrict__ p) {
     // Streaming loads: the working set (>=1 GiB) dwarfs L2, so bypassing the
@@ -39,8 +88,38 @@ struct Args {
     int iterations = 50;
     int device_id = 0;
     double scale = 1.0;
-    int blocks_per_cu = 16;
+    int blocks_per_cu = 0;
 };
+
+template <typename T>
+int default_blocks_per_cu_for_mode(const std::string& mode) {
+    if(mode == "scale") {
+        return KernelTuning<T>::kScaleBlocksPerCu;
+    }
+    if(mode == "triad") {
+        return KernelTuning<T>::kTriadBlocksPerCu;
+    }
+    return 16;
+}
+
+template <typename T>
+int resolve_blocks_per_cu(const Args& args) {
+    if(args.blocks_per_cu > 0) {
+        return args.blocks_per_cu;
+    }
+    return default_blocks_per_cu_for_mode<T>(args.mode);
+}
+
+template <typename T>
+int vector_unroll_for_mode(const std::string& mode) {
+    if(mode == "scale") {
+        return KernelTuning<T>::kScaleVectorUnroll;
+    }
+    if(mode == "triad") {
+        return KernelTuning<T>::kTriadVectorUnroll;
+    }
+    return 0;
+}
 
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
@@ -106,24 +185,27 @@ __device__ __forceinline__ void triad_vector(Vec16& a, const Vec16& b, T alpha) 
     }
 }
 
-template <typename T>
-__global__ __launch_bounds__(kThreadsPerBlock) void scale_kernel(
+template <typename T, int ThreadsPerBlock = KernelTuning<T>::kThreadsPerBlock>
+__global__ __launch_bounds__(ThreadsPerBlock) void scale_kernel(
     const T* __restrict__ src, T* __restrict__ dst, T alpha, std::size_t count) {
+    constexpr int kVectorUnroll = KernelTuning<T>::kScaleVectorUnroll;
+    static_assert(kVectorUnroll % 2 == 0, "double-buffered pipeline requires even unroll");
+    constexpr int kPipelineStage = kVectorUnroll / 2;
     constexpr std::size_t vec_width = sizeof(Vec16) / sizeof(T);
 
     const std::size_t vec_count = count / vec_width;
     const Vec16* __restrict__ src_v = reinterpret_cast<const Vec16*>(src);
     Vec16* __restrict__ dst_v = reinterpret_cast<Vec16*>(dst);
 
-    // Block-chunk pattern: each block processes a contiguous kComputeVectorUnroll*blockDim
+    // Block-chunk pattern: each block processes a contiguous kVectorUnroll*blockDim
     // chunk of vectors so a wave's unrolled loads hit consecutive HBM rows (better row-
     // buffer locality than grid-stride with millions of elements between unrolled loads).
-    const std::size_t block_chunk = static_cast<std::size_t>(blockDim.x) * kComputeVectorUnroll;
+    const std::size_t block_chunk = static_cast<std::size_t>(blockDim.x) * kVectorUnroll;
     const std::size_t grid_chunk = static_cast<std::size_t>(gridDim.x) * block_chunk;
     const std::size_t block_stride = blockDim.x;
 
     std::size_t base = static_cast<std::size_t>(blockIdx.x) * block_chunk + threadIdx.x;
-    for(; base + (kComputeVectorUnroll - 1) * block_stride < vec_count; base += grid_chunk) {
+    for(; base + (kVectorUnroll - 1) * block_stride < vec_count; base += grid_chunk) {
         // Two-stage software pipeline: issue second-half loads while the first
         // half is still in flight/being computed, then overlap first-half
         // stores with second-half compute. Gives the scheduler strictly more
@@ -169,10 +251,13 @@ __global__ __launch_bounds__(kThreadsPerBlock) void scale_kernel(
     }
 }
 
-template <typename T>
-__global__ __launch_bounds__(kThreadsPerBlock) void triad_kernel(
+template <typename T, int ThreadsPerBlock = KernelTuning<T>::kThreadsPerBlock>
+__global__ __launch_bounds__(ThreadsPerBlock) void triad_kernel(
     const T* __restrict__ src, const T* __restrict__ aux, T* __restrict__ dst,
     T alpha, std::size_t count) {
+    constexpr int kVectorUnroll = KernelTuning<T>::kTriadVectorUnroll;
+    static_assert(kVectorUnroll % 2 == 0, "double-buffered pipeline requires even unroll");
+    constexpr int kPipelineStage = kVectorUnroll / 2;
     constexpr std::size_t vec_width = sizeof(Vec16) / sizeof(T);
 
     const std::size_t vec_count = count / vec_width;
@@ -180,12 +265,12 @@ __global__ __launch_bounds__(kThreadsPerBlock) void triad_kernel(
     const Vec16* __restrict__ aux_v = reinterpret_cast<const Vec16*>(aux);
     Vec16* __restrict__ dst_v = reinterpret_cast<Vec16*>(dst);
 
-    const std::size_t block_chunk = static_cast<std::size_t>(blockDim.x) * kComputeVectorUnroll;
+    const std::size_t block_chunk = static_cast<std::size_t>(blockDim.x) * kVectorUnroll;
     const std::size_t grid_chunk = static_cast<std::size_t>(gridDim.x) * block_chunk;
     const std::size_t block_stride = blockDim.x;
 
     std::size_t base = static_cast<std::size_t>(blockIdx.x) * block_chunk + threadIdx.x;
-    for(; base + (kComputeVectorUnroll - 1) * block_stride < vec_count; base += grid_chunk) {
+    for(; base + (kVectorUnroll - 1) * block_stride < vec_count; base += grid_chunk) {
         // Two-stage pipeline with src/aux interleaved within each stage: the
         // HBM controller sees requests on both input buffers early, and the
         // second-half loads issue while the first half is computing/storing.
@@ -269,12 +354,12 @@ double run_kernel(const Args& args) {
     check_hip(hipEventCreate(&start), "hipEventCreate(start)");
     check_hip(hipEventCreate(&stop), "hipEventCreate(stop)");
 
-    const int threads = kThreadsPerBlock;
+    const int threads = KernelTuning<T>::kThreadsPerBlock;
     // A wide grid keeps multiple wavefronts per CU queued without pushing the
     // per-thread work chunk so small that loop overhead dominates.
     constexpr std::size_t vec_bytes = 16;
     const std::size_t vec_count = data_bytes / vec_bytes;
-    const int blocks_per_cu = std::max(1, args.blocks_per_cu);
+    const int blocks_per_cu = std::max(1, resolve_blocks_per_cu<T>(args));
     const int max_blocks = std::max(1, props.multiProcessorCount * blocks_per_cu);
     const int blocks_by_work = static_cast<int>(std::min<std::size_t>(
         static_cast<std::size_t>(max_blocks),
@@ -344,7 +429,11 @@ template <typename T>
 int emit_success(const Args& args) {
     const double elapsed_s = run_kernel<T>(args);
     std::cout << "{\"status\":\"ok\",\"raw_metrics\":{\"elapsed_s\":" << elapsed_s
-              << "},\"metadata\":{\"implementation\":\"hip\"}}" << std::endl;
+              << "},\"metadata\":{\"implementation\":\"hip\""
+              << ",\"threads_per_block\":" << KernelTuning<T>::kThreadsPerBlock
+              << ",\"vector_unroll\":" << vector_unroll_for_mode<T>(args.mode)
+              << ",\"blocks_per_cu\":" << resolve_blocks_per_cu<T>(args)
+              << "}}" << std::endl;
     return 0;
 }
 
