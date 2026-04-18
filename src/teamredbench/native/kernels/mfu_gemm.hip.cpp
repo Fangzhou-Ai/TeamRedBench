@@ -285,116 +285,6 @@ __global__ void fill_kernel(T* data, std::size_t count, T value) {
     }
 }
 
-template <
-    typename T,
-    int ThreadsX = KernelTuning<T>::kThreadsX,
-    int ThreadsY = KernelTuning<T>::kThreadsY,
-    int ThreadTileM = KernelTuning<T>::kThreadTileM,
-    int ThreadTileN = KernelTuning<T>::kThreadTileN,
-    int BlockTileK = KernelTuning<T>::kScalarBlockTileK>
-__global__ __launch_bounds__(ThreadsX * ThreadsY) void scalar_gemm_kernel(
-    const T* __restrict__ a,
-    const T* __restrict__ b,
-    AccumT<T>* __restrict__ c,
-    int m,
-    int n,
-    int k) {
-    using Acc = AccumT<T>;
-    constexpr int kThreadsPerBlock = ThreadsX * ThreadsY;
-    constexpr int kBlockTileM = ThreadsY * ThreadTileM;
-    constexpr int kBlockTileN = ThreadsX * ThreadTileN;
-
-    __shared__ T a_tile[kBlockTileM * BlockTileK];
-    __shared__ T b_tile[BlockTileK * kBlockTileN];
-
-    const int linear_tid = static_cast<int>(threadIdx.y) * ThreadsX + static_cast<int>(threadIdx.x);
-    const int tiles_n = (n + kBlockTileN - 1) / kBlockTileN;
-    const int tiles_m = (m + kBlockTileM - 1) / kBlockTileM;
-    const int total_tiles = tiles_m * tiles_n;
-
-    for(int tile_linear = static_cast<int>(blockIdx.x); tile_linear < total_tiles; tile_linear += static_cast<int>(gridDim.x)) {
-        const int tile_row = tile_linear / tiles_n;
-        const int tile_col = tile_linear % tiles_n;
-        const int row_base = tile_row * kBlockTileM;
-        const int col_base = tile_col * kBlockTileN;
-        const int thread_row = static_cast<int>(threadIdx.y) * ThreadTileM;
-        const int thread_col = static_cast<int>(threadIdx.x) * ThreadTileN;
-
-        Acc accum[ThreadTileM][ThreadTileN];
-        #pragma unroll
-        for(int i = 0; i < ThreadTileM; ++i) {
-            #pragma unroll
-            for(int j = 0; j < ThreadTileN; ++j) {
-                accum[i][j] = static_cast<Acc>(0);
-            }
-        }
-
-        for(int k_base = 0; k_base < k; k_base += BlockTileK) {
-            for(int index = linear_tid; index < kBlockTileM * BlockTileK; index += kThreadsPerBlock) {
-                const int tile_row_offset = index / BlockTileK;
-                const int tile_k_offset = index % BlockTileK;
-                const int global_row = row_base + tile_row_offset;
-                const int global_k = k_base + tile_k_offset;
-                a_tile[index] = (global_row < m && global_k < k)
-                    ? a[static_cast<std::size_t>(global_row) * static_cast<std::size_t>(k) + static_cast<std::size_t>(global_k)]
-                    : cast_scalar<T>(0.0);
-            }
-
-            for(int index = linear_tid; index < BlockTileK * kBlockTileN; index += kThreadsPerBlock) {
-                const int tile_k_offset = index / kBlockTileN;
-                const int tile_col_offset = index % kBlockTileN;
-                const int global_k = k_base + tile_k_offset;
-                const int global_col = col_base + tile_col_offset;
-                b_tile[index] = (global_k < k && global_col < n)
-                    ? b[static_cast<std::size_t>(global_k) * static_cast<std::size_t>(n) + static_cast<std::size_t>(global_col)]
-                    : cast_scalar<T>(0.0);
-            }
-            __syncthreads();
-
-            #pragma unroll
-            for(int kk = 0; kk < BlockTileK; ++kk) {
-                Acc a_frag[ThreadTileM];
-                Acc b_frag[ThreadTileN];
-
-                #pragma unroll
-                for(int i = 0; i < ThreadTileM; ++i) {
-                    a_frag[i] = to_accum(a_tile[(thread_row + i) * BlockTileK + kk]);
-                }
-                #pragma unroll
-                for(int j = 0; j < ThreadTileN; ++j) {
-                    b_frag[j] = to_accum(b_tile[kk * kBlockTileN + thread_col + j]);
-                }
-
-                #pragma unroll
-                for(int i = 0; i < ThreadTileM; ++i) {
-                    #pragma unroll
-                    for(int j = 0; j < ThreadTileN; ++j) {
-                        accum[i][j] += a_frag[i] * b_frag[j];
-                    }
-                }
-            }
-            __syncthreads();
-        }
-
-        #pragma unroll
-        for(int i = 0; i < ThreadTileM; ++i) {
-            const int global_row = row_base + thread_row + i;
-            if(global_row >= m) {
-                continue;
-            }
-            #pragma unroll
-            for(int j = 0; j < ThreadTileN; ++j) {
-                const int global_col = col_base + thread_col + j;
-                if(global_col >= n) {
-                    continue;
-                }
-                c[static_cast<std::size_t>(global_row) * static_cast<std::size_t>(n)
-                  + static_cast<std::size_t>(global_col)] = accum[i][j];
-            }
-        }
-    }
-}
-
 // Optimized MFMA GEMM kernel.
 //   * Block tile is FragM * WaveGridM * WaveTileM  x  FragN * WaveGridN * WaveTileN
 //     (e.g. 128x128 for fp16/bf16/fp32 with WaveTile=4x4, WaveGrid=2x2).
@@ -641,46 +531,24 @@ double run_kernel(const Args& args, bool* used_mfma) {
     check_hip(hipStreamSynchronize(stream), "hipStreamSynchronize(init)");
 
     const bool use_mfma = can_use_mfma<T>(args);
+    // We only benchmark MFMA kernel
+    assert(use_mfma && "MFMA kernel is not properly called");
+
     if(used_mfma != nullptr) {
         *used_mfma = use_mfma;
     }
 
     auto launch_once = [&]() {
-        if(use_mfma) {
-            const int blocks = std::max(
-                1,
-                std::min(
-                    std::max(1, (args.m / mfma_block_tile_m<T>()) * (args.n / mfma_block_tile_n<T>())),
-                    props.multiProcessorCount * std::max(1, resolve_mfma_blocks_per_cu<T>(args))
-                )
-            );
-            hipLaunchKernelGGL(mfma_gemm_kernel<T>, dim3(blocks), dim3(mfma_threads_per_block<T>()), 0, stream, a, b, c, args.m, args.n, args.k);
-            check_hip(hipGetLastError(), "mfma_gemm_kernel");
-            return;
-        }
-
         const int blocks = std::max(
             1,
             std::min(
-                std::max(1, ((args.m + scalar_block_tile_m<T>() - 1) / scalar_block_tile_m<T>())
-                              * ((args.n + scalar_block_tile_n<T>() - 1) / scalar_block_tile_n<T>())),
-                props.multiProcessorCount * std::max(1, resolve_scalar_blocks_per_cu<T>(args))
+                std::max(1, (args.m / mfma_block_tile_m<T>()) * (args.n / mfma_block_tile_n<T>())),
+                props.multiProcessorCount * std::max(1, resolve_mfma_blocks_per_cu<T>(args))
             )
         );
-        hipLaunchKernelGGL(
-            scalar_gemm_kernel<T>,
-            dim3(blocks),
-            dim3(KernelTuning<T>::kThreadsX, KernelTuning<T>::kThreadsY),
-            0,
-            stream,
-            a,
-            b,
-            c,
-            args.m,
-            args.n,
-            args.k
-        );
-        check_hip(hipGetLastError(), "scalar_gemm_kernel");
+        hipLaunchKernelGGL(mfma_gemm_kernel<T>, dim3(blocks), dim3(mfma_threads_per_block<T>()), 0, stream, a, b, c, args.m, args.n, args.k);
+        check_hip(hipGetLastError(), "mfma_gemm_kernel");
+        return;
     };
 
     for(int iteration = 0; iteration < args.warmup; ++iteration) {
