@@ -59,9 +59,9 @@ struct KernelTuning<rocwmma::float16_t> {
     static constexpr int kMfmaWaveTileN = 2;
     static constexpr int kMfmaKStages = 1;          // BlockTileK = 32
     static constexpr int kMfmaBlocksPerCu = 2;
-    static constexpr int kMfmaTileGroupM = 8;
-    static constexpr int kMfmaLdsPadA = 0;
-    static constexpr int kMfmaLdsPadB = 16;
+    static constexpr int kMfmaTileGroupM = 2;
+    static constexpr int kMfmaLdsPadA = 16;
+    static constexpr int kMfmaLdsPadB = 0;
 };
 
 template <>
@@ -82,9 +82,9 @@ struct KernelTuning<rocwmma::bfloat16_t> {
     static constexpr int kMfmaWaveTileN = 2;
     static constexpr int kMfmaKStages = 1;
     static constexpr int kMfmaBlocksPerCu = 2;
-    static constexpr int kMfmaTileGroupM = 8;
-    static constexpr int kMfmaLdsPadA = 0;
-    static constexpr int kMfmaLdsPadB = 16;
+    static constexpr int kMfmaTileGroupM = 2;
+    static constexpr int kMfmaLdsPadA = 16;
+    static constexpr int kMfmaLdsPadB = 0;
 };
 
 template <>
