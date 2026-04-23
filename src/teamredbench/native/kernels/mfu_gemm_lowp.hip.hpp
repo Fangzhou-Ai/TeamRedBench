@@ -8,15 +8,15 @@ template <>
 struct KernelTuning<rocwmma::float16_t> {
     static constexpr int kFragM = 16;
     static constexpr int kFragN = 16;
-    static constexpr int kFragK = 32;
+    static constexpr int kFragK = 16;
     static constexpr int kMfmaWaveGridM = 4;
     static constexpr int kMfmaWaveGridN = 2;
     static constexpr int kMfmaWaveTileM = 4;
     static constexpr int kMfmaWaveTileN = 4;
-    static constexpr int kMfmaKStages = 1;
+    static constexpr int kMfmaKStages = 2;
     static constexpr int kMfmaBlocksPerCu = 2;
     static constexpr int kMfmaTileGroupM = 8;
-    static constexpr int kMfmaLdsPadA = 16;
+    static constexpr int kMfmaLdsPadA = 8;
     static constexpr int kMfmaLdsPadB = 0;
 };
 
@@ -24,26 +24,29 @@ template <>
 struct KernelTuning<rocwmma::bfloat16_t> {
     static constexpr int kFragM = 16;
     static constexpr int kFragN = 16;
-    static constexpr int kFragK = 32;
+    static constexpr int kFragK = 16;
     static constexpr int kMfmaWaveGridM = 2;
     static constexpr int kMfmaWaveGridN = 4;
     static constexpr int kMfmaWaveTileM = 4;
     static constexpr int kMfmaWaveTileN = 4;
-    static constexpr int kMfmaKStages = 1;
+    static constexpr int kMfmaKStages = 2;
     static constexpr int kMfmaBlocksPerCu = 2;
     static constexpr int kMfmaTileGroupM = 8;
-    static constexpr int kMfmaLdsPadA = 16;
+    static constexpr int kMfmaLdsPadA = 8;
     static constexpr int kMfmaLdsPadB = 0;
 };
 
+// Row-stride (along N) of a packed B tile. Tiles are stored row-major so that
+// rocWMMA's row_major matrix_b fragments read them cleanly; the original
+// col_major layout hit a correctness bug in rocWMMA's 16x16x32 fp16/bf16 path.
 template <typename T>
 constexpr int packed_b_tile_stride() {
-    return mfma_block_tile_k<T>() + KernelTuning<T>::kMfmaLdsPadB;
+    return mfma_block_tile_n<T>() + KernelTuning<T>::kMfmaLdsPadB;
 }
 
 template <typename T>
 constexpr std::size_t packed_b_tile_elements() {
-    return static_cast<std::size_t>(mfma_block_tile_n<T>()) * static_cast<std::size_t>(packed_b_tile_stride<T>());
+    return static_cast<std::size_t>(mfma_block_tile_k<T>()) * static_cast<std::size_t>(packed_b_tile_stride<T>());
 }
 
 template <typename T>
@@ -53,9 +56,9 @@ __device__ __forceinline__ void global_load_vec16_to_lds(const T* src, T* dst) {
     __builtin_amdgcn_global_load_lds(global_ptr, lds_ptr, 16u, 0, 0u);
 }
 
-// Pack B once into tile-major, column-major blocks so the timed kernel can use
-// vector global loads and a low-conflict LDS layout without paying the
-// transpose/scatter cost every iteration.
+// Pack B once into tile-local row-major blocks so the timed kernel can use
+// contiguous global_load_lds transfers and a row_major matrix_b fragment load
+// without paying the gather/stride cost every iteration.
 template <
     typename T,
     int FragM = KernelTuning<T>::kFragM,
@@ -72,12 +75,13 @@ __global__ void pack_b_tiles_kernel(const T* __restrict__ b, T* __restrict__ b_p
     constexpr int kBlockTileK = FragK * KStages;
     constexpr int kVecBytes = 16;
     constexpr int kVecElems = kVecBytes / static_cast<int>(sizeof(T));
-    constexpr int kPackedStride = kBlockTileK + LdsPadB;
-    constexpr int kVecsPerCol = kBlockTileK / kVecElems;
-    constexpr int kTotalVecs = kBlockTileN * kVecsPerCol;
+    constexpr int kPackedStride = kBlockTileN + LdsPadB;
+    constexpr int kVecsPerRow = kBlockTileN / kVecElems;
+    constexpr int kTotalVecs = kBlockTileK * kVecsPerRow;
 
     static_assert((kPackedStride * static_cast<int>(sizeof(T))) % kVecBytes == 0,
                   "Packed B stride must keep 16-byte alignment");
+    static_assert(kBlockTileN % kVecElems == 0, "BlockTileN must be divisible by vector elements");
 
     const int tiles_n = n / kBlockTileN;
     const int tiles_k = k / kBlockTileK;
@@ -94,24 +98,15 @@ __global__ void pack_b_tiles_kernel(const T* __restrict__ b, T* __restrict__ b_p
     const std::size_t packed_tile_offset = static_cast<std::size_t>(tile_id) * packed_b_tile_elements<T>();
 
     for(int vi = static_cast<int>(threadIdx.x); vi < kTotalVecs; vi += static_cast<int>(blockDim.x)) {
-        const int col_in_tile = vi / kVecsPerCol;
-        const int vec_in_col = vi % kVecsPerCol;
-        union PackedVec {
-            uint4 raw;
-            T elem[kVecElems];
-        } packed{};
-
-        #pragma unroll
-        for(int elem = 0; elem < kVecElems; ++elem) {
-            const int row_in_tile = vec_in_col * kVecElems + elem;
-            packed.elem[elem] = b[static_cast<std::size_t>(k_base + row_in_tile) * static_cast<std::size_t>(n)
-                                 + static_cast<std::size_t>(n_base + col_in_tile)];
-        }
-
+        const int row_in_tile = vi / kVecsPerRow;
+        const int vec_in_row = vi % kVecsPerRow;
+        const uint4 v = *reinterpret_cast<const uint4*>(
+            b + static_cast<std::size_t>(k_base + row_in_tile) * static_cast<std::size_t>(n)
+              + static_cast<std::size_t>(n_base + vec_in_row * kVecElems));
         *reinterpret_cast<uint4*>(
             &b_packed[packed_tile_offset
-                      + static_cast<std::size_t>(col_in_tile) * static_cast<std::size_t>(kPackedStride)
-                      + static_cast<std::size_t>(vec_in_col * kVecElems)]) = packed.raw;
+                      + static_cast<std::size_t>(row_in_tile) * static_cast<std::size_t>(kPackedStride)
+                      + static_cast<std::size_t>(vec_in_row * kVecElems)]) = v;
     }
 }
 
@@ -139,7 +134,7 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
                   "Low-precision kernel only supports fp16 and bf16");
     using Acc = AccumT<T>;
     using FragA = rocwmma::fragment<rocwmma::matrix_a, FragM, FragN, FragK, T, rocwmma::row_major>;
-    using FragB = rocwmma::fragment<rocwmma::matrix_b, FragM, FragN, FragK, T, rocwmma::col_major>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b, FragM, FragN, FragK, T, rocwmma::row_major>;
     using FragC = rocwmma::fragment<rocwmma::accumulator, FragM, FragN, FragK, Acc>;
     using FragOut = rocwmma::fragment<rocwmma::accumulator, FragM, FragN, FragK, T, rocwmma::row_major>;
 
@@ -151,20 +146,21 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
     constexpr int kVecBytes = 16;
     constexpr int kVecElems = kVecBytes / static_cast<int>(sizeof(T));
     constexpr int kAVecsPerRow = kBlockTileK / kVecElems;
-    constexpr int kPackedBVecsPerCol = kBlockTileK / kVecElems;
+    constexpr int kBVecsPerRow = kBlockTileN / kVecElems;
     constexpr int kATotalVecs = kBlockTileM * kAVecsPerRow;
-    constexpr int kBTotalVecs = kBlockTileN * kPackedBVecsPerCol;
+    constexpr int kBTotalVecs = kBlockTileK * kBVecsPerRow;
     constexpr int kATileStride = kBlockTileK + LdsPadA;
-    constexpr int kBTileStride = kBlockTileK + LdsPadB;
+    constexpr int kBTileStride = kBlockTileN + LdsPadB;
 
     static_assert(kBlockTileK % kVecElems == 0, "BlockTileK must be divisible by vector elements");
+    static_assert(kBlockTileN % kVecElems == 0, "BlockTileN must be divisible by vector elements");
     static_assert((kATileStride * static_cast<int>(sizeof(T))) % kVecBytes == 0,
                   "A LDS stride must keep 16-byte alignment");
     static_assert((kBTileStride * static_cast<int>(sizeof(T))) % kVecBytes == 0,
                   "B LDS stride must keep 16-byte alignment");
 
     __shared__ T a_tile[2][kBlockTileM * kATileStride];
-    __shared__ T b_tile[2][kBlockTileN * kBTileStride];
+    __shared__ T b_tile[2][kBlockTileK * kBTileStride];
 
     const int linear_tid = static_cast<int>(threadIdx.x);
     const int wave_id = linear_tid / 64;
@@ -182,10 +178,11 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
             const int vec_in_row = vi % kAVecsPerRow;
             const int global_row = row_base + row_in_tile;
             const int global_k = k_base + vec_in_row * kVecElems;
-            global_load_vec16_to_lds(
+            const uint4 v = *reinterpret_cast<const uint4*>(
                 a + static_cast<std::size_t>(global_row) * static_cast<std::size_t>(k)
-                  + static_cast<std::size_t>(global_k),
-                &a_tile[buf][row_in_tile * kATileStride + vec_in_row * kVecElems]);
+                  + static_cast<std::size_t>(global_k));
+            *reinterpret_cast<uint4*>(
+                &a_tile[buf][row_in_tile * kATileStride + vec_in_row * kVecElems]) = v;
         }
     };
 
@@ -198,13 +195,14 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
 
         #pragma unroll 1
         for(int vi = linear_tid; vi < kBTotalVecs; vi += kThreadsPerBlock) {
-            const int col_in_tile = vi / kPackedBVecsPerCol;
-            const int vec_in_col = vi % kPackedBVecsPerCol;
-            global_load_vec16_to_lds(
+            const int row_in_tile = vi / kBVecsPerRow;
+            const int vec_in_row = vi % kBVecsPerRow;
+            const uint4 v = *reinterpret_cast<const uint4*>(
                 b_packed + packed_tile_offset
-                    + static_cast<std::size_t>(col_in_tile) * static_cast<std::size_t>(kBTileStride)
-                    + static_cast<std::size_t>(vec_in_col * kVecElems),
-                &b_tile[buf][col_in_tile * kBTileStride + vec_in_col * kVecElems]);
+                    + static_cast<std::size_t>(row_in_tile) * static_cast<std::size_t>(kBTileStride)
+                    + static_cast<std::size_t>(vec_in_row * kVecElems));
+            *reinterpret_cast<uint4*>(
+                &b_tile[buf][row_in_tile * kBTileStride + vec_in_row * kVecElems]) = v;
         }
     };
 
@@ -227,7 +225,7 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
                 const int b_col = (wave_col * WaveTileN + j) * FragN;
                 rocwmma::load_matrix_sync(
                     b_frag[j],
-                    &b_tile[buf][b_col * kBTileStride + ks * FragK],
+                    &b_tile[buf][ks * FragK * kBTileStride + b_col],
                     kBTileStride);
             }
             #pragma unroll
