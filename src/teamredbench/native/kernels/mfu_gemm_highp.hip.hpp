@@ -27,13 +27,13 @@ struct KernelTuning<double> {
     static constexpr int kFragK = 4;
     static constexpr int kMfmaWaveGridM = 2;
     static constexpr int kMfmaWaveGridN = 2;
-    static constexpr int kMfmaWaveTileM = 2;
-    static constexpr int kMfmaWaveTileN = 2;
-    static constexpr int kMfmaKStages = 2;
-    static constexpr int kMfmaBlocksPerCu = 2;
+    static constexpr int kMfmaWaveTileM = 4;
+    static constexpr int kMfmaWaveTileN = 4;
+    static constexpr int kMfmaKStages = 1;
+    static constexpr int kMfmaBlocksPerCu = 3;
     static constexpr int kMfmaTileGroupM = 8;
-    static constexpr int kMfmaLdsPadA = 0;
-    static constexpr int kMfmaLdsPadB = 0;
+    static constexpr int kMfmaLdsPadA = 2;
+    static constexpr int kMfmaLdsPadB = 2;
 };
 
 template <
