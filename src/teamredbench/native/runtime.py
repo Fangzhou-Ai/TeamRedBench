@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from typing import Any
@@ -175,6 +176,28 @@ def _find_hip_compiler(preferred: str | None = None) -> str:
     )
 
 
+_LOCAL_INCLUDE_PATTERN = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
+
+
+def _update_source_digest(digest: hashlib._Hash, source_path: Path, seen: set[Path] | None = None) -> None:
+    resolved = source_path.resolve()
+    if seen is None:
+        seen = set()
+    if resolved in seen:
+        return
+    seen.add(resolved)
+
+    digest.update(str(resolved).encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(resolved.read_bytes())
+
+    contents = resolved.read_text(encoding="utf-8", errors="ignore")
+    for include in _LOCAL_INCLUDE_PATTERN.findall(contents):
+        include_path = (resolved.parent / include).resolve()
+        if include_path.exists():
+            _update_source_digest(digest, include_path, seen)
+
+
 def prepare_native_kernel_binary(kernel: ResolvedNativeKernel) -> Path:
     if kernel.binary_path is not None:
         if not kernel.binary_path.exists():
@@ -191,7 +214,7 @@ def prepare_native_kernel_binary(kernel: ResolvedNativeKernel) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     digest = hashlib.sha256()
-    digest.update(kernel.source_path.read_bytes())
+    _update_source_digest(digest, kernel.source_path)
     digest.update(kernel.benchmark.encode("utf-8"))
     digest.update(kernel.name.encode("utf-8"))
     digest.update(compiler.encode("utf-8"))

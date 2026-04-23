@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
@@ -8,6 +9,8 @@ import yaml
 import teamredbench.builtin  # noqa: F401
 from teamredbench.cli import app
 from teamredbench.native.registry import list_native_kernels
+import teamredbench.native.runtime as native_runtime
+from teamredbench.native.runtime import ResolvedNativeKernel
 from teamredbench.runner import run_suite
 
 
@@ -210,3 +213,41 @@ def test_run_suite_mfu_native_backend_uses_relative_binary(tmp_path: Path):
     assert "--m" in argv and "1024" in argv
     assert "--n" in argv and "1024" in argv
     assert "--k" in argv and "1024" in argv
+
+
+def test_prepare_native_kernel_binary_rebuilds_when_local_include_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source = tmp_path / "kernel.hip.cpp"
+    include = tmp_path / "kernel_impl.hip.hpp"
+    cache_dir = tmp_path / "native-cache"
+
+    source.write_text('#include "kernel_impl.hip.hpp"\nint main() { return kValue; }\n', encoding="utf-8")
+    include.write_text("static constexpr int kValue = 0;\n", encoding="utf-8")
+
+    monkeypatch.setattr(native_runtime, "_find_hip_compiler", lambda preferred=None: "/opt/rocm/bin/hipcc")
+
+    compile_outputs: list[Path] = []
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        output_index = command.index("-o") + 1
+        output_path = Path(command[output_index])
+        output_path.write_text("fake-binary", encoding="utf-8")
+        compile_outputs.append(output_path)
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(native_runtime.subprocess, "run", fake_run)
+
+    kernel = ResolvedNativeKernel(
+        benchmark="mfu",
+        name="unit-test-kernel",
+        description="cache test",
+        source_path=source,
+        cache_dir=cache_dir,
+    )
+
+    first_binary = native_runtime.prepare_native_kernel_binary(kernel)
+
+    include.write_text("static constexpr int kValue = 1;\n", encoding="utf-8")
+    second_binary = native_runtime.prepare_native_kernel_binary(kernel)
+
+    assert first_binary != second_binary
+    assert compile_outputs == [first_binary, second_binary]
