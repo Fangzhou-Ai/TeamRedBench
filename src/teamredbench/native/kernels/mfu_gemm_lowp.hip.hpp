@@ -25,8 +25,8 @@ struct KernelTuning<rocwmma::bfloat16_t> {
     static constexpr int kFragM = 16;
     static constexpr int kFragN = 16;
     static constexpr int kFragK = 32;
-    static constexpr int kMfmaWaveGridM = 4;
-    static constexpr int kMfmaWaveGridN = 2;
+    static constexpr int kMfmaWaveGridM = 2;
+    static constexpr int kMfmaWaveGridN = 4;
     static constexpr int kMfmaWaveTileM = 4;
     static constexpr int kMfmaWaveTileN = 4;
     static constexpr int kMfmaKStages = 1;
@@ -44,6 +44,13 @@ constexpr int packed_b_tile_stride() {
 template <typename T>
 constexpr std::size_t packed_b_tile_elements() {
     return static_cast<std::size_t>(mfma_block_tile_n<T>()) * static_cast<std::size_t>(packed_b_tile_stride<T>());
+}
+
+template <typename T>
+__device__ __forceinline__ void global_load_vec16_to_lds(const T* src, T* dst) {
+    auto* global_ptr = (__attribute__((address_space(1))) void*)(const_cast<T*>(src));
+    auto* lds_ptr = (__attribute__((address_space(3))) void*)(dst);
+    __builtin_amdgcn_global_load_lds(global_ptr, lds_ptr, 16u, 0, 0u);
 }
 
 // Pack B once into tile-major, column-major blocks so the timed kernel can use
@@ -175,11 +182,10 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
             const int vec_in_row = vi % kAVecsPerRow;
             const int global_row = row_base + row_in_tile;
             const int global_k = k_base + vec_in_row * kVecElems;
-            const uint4 v = *reinterpret_cast<const uint4*>(
+            global_load_vec16_to_lds(
                 a + static_cast<std::size_t>(global_row) * static_cast<std::size_t>(k)
-                  + static_cast<std::size_t>(global_k));
-            *reinterpret_cast<uint4*>(
-                &a_tile[buf][row_in_tile * kATileStride + vec_in_row * kVecElems]) = v;
+                  + static_cast<std::size_t>(global_k),
+                &a_tile[buf][row_in_tile * kATileStride + vec_in_row * kVecElems]);
         }
     };
 
@@ -194,12 +200,11 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
         for(int vi = linear_tid; vi < kBTotalVecs; vi += kThreadsPerBlock) {
             const int col_in_tile = vi / kPackedBVecsPerCol;
             const int vec_in_col = vi % kPackedBVecsPerCol;
-            const uint4 v = *reinterpret_cast<const uint4*>(
+            global_load_vec16_to_lds(
                 b_packed + packed_tile_offset
                     + static_cast<std::size_t>(col_in_tile) * static_cast<std::size_t>(kBTileStride)
-                    + static_cast<std::size_t>(vec_in_col * kVecElems));
-            *reinterpret_cast<uint4*>(
-                &b_tile[buf][col_in_tile * kBTileStride + vec_in_col * kVecElems]) = v;
+                    + static_cast<std::size_t>(vec_in_col * kVecElems),
+                &b_tile[buf][col_in_tile * kBTileStride + vec_in_col * kVecElems]);
         }
     };
 
@@ -236,6 +241,10 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
     };
 
     for(int tile_linear = static_cast<int>(blockIdx.x); tile_linear < total_tiles; tile_linear += static_cast<int>(gridDim.x)) {
+        // Let the backend interleave LDS reads and MFMA issue more aggressively
+        // in the hot GEMM loop.
+        __builtin_amdgcn_iglp_opt(0);
+
         const int group_stride = TileGroupM * tiles_n;
         const int group_id = tile_linear / group_stride;
         const int first_tile_m = group_id * TileGroupM;
