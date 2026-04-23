@@ -9,15 +9,15 @@ struct KernelTuning<rocwmma::float16_t> {
     static constexpr int kFragM = 16;
     static constexpr int kFragN = 16;
     static constexpr int kFragK = 32;
-    static constexpr int kMfmaWaveGridM = 2;
-    static constexpr int kMfmaWaveGridN = 4;
-    static constexpr int kMfmaWaveTileM = 8;
-    static constexpr int kMfmaWaveTileN = 2;
+    static constexpr int kMfmaWaveGridM = 4;
+    static constexpr int kMfmaWaveGridN = 2;
+    static constexpr int kMfmaWaveTileM = 4;
+    static constexpr int kMfmaWaveTileN = 4;
     static constexpr int kMfmaKStages = 1;
     static constexpr int kMfmaBlocksPerCu = 2;
-    static constexpr int kMfmaTileGroupM = 2;
+    static constexpr int kMfmaTileGroupM = 8;
     static constexpr int kMfmaLdsPadA = 16;
-    static constexpr int kMfmaLdsPadB = 8;
+    static constexpr int kMfmaLdsPadB = 0;
 };
 
 template <>
@@ -25,15 +25,15 @@ struct KernelTuning<rocwmma::bfloat16_t> {
     static constexpr int kFragM = 16;
     static constexpr int kFragN = 16;
     static constexpr int kFragK = 32;
-    static constexpr int kMfmaWaveGridM = 2;
-    static constexpr int kMfmaWaveGridN = 4;
-    static constexpr int kMfmaWaveTileM = 8;
-    static constexpr int kMfmaWaveTileN = 2;
+    static constexpr int kMfmaWaveGridM = 4;
+    static constexpr int kMfmaWaveGridN = 2;
+    static constexpr int kMfmaWaveTileM = 4;
+    static constexpr int kMfmaWaveTileN = 4;
     static constexpr int kMfmaKStages = 1;
     static constexpr int kMfmaBlocksPerCu = 2;
-    static constexpr int kMfmaTileGroupM = 2;
+    static constexpr int kMfmaTileGroupM = 8;
     static constexpr int kMfmaLdsPadA = 16;
-    static constexpr int kMfmaLdsPadB = 8;
+    static constexpr int kMfmaLdsPadB = 0;
 };
 
 template <typename T>
@@ -61,8 +61,6 @@ template <
     int KStages = KernelTuning<T>::kMfmaKStages,
     int LdsPadB = KernelTuning<T>::kMfmaLdsPadB>
 __global__ void pack_b_tiles_kernel(const T* __restrict__ b, T* __restrict__ b_packed, int n, int k) {
-    static_assert(KStages == 1, "low-precision packed-B path expects a single K stage");
-
     constexpr int kBlockTileN = FragN * WaveGridN * WaveTileN;
     constexpr int kBlockTileK = FragK * KStages;
     constexpr int kVecBytes = 16;
@@ -132,8 +130,6 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
     int k) {
     static_assert(std::is_same_v<T, rocwmma::float16_t> || std::is_same_v<T, rocwmma::bfloat16_t>,
                   "Low-precision kernel only supports fp16 and bf16");
-    static_assert(KStages == 1, "low-precision packed-B path expects a single K stage");
-
     using Acc = AccumT<T>;
     using FragA = rocwmma::fragment<rocwmma::matrix_a, FragM, FragN, FragK, T, rocwmma::row_major>;
     using FragB = rocwmma::fragment<rocwmma::matrix_b, FragM, FragN, FragK, T, rocwmma::col_major>;
@@ -208,30 +204,33 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
     };
 
     auto compute_stage = [&](int buf, FragC accum[WaveTileM][WaveTileN]) {
-        FragA a_frag[WaveTileM];
-        FragB b_frag[WaveTileN];
+        #pragma unroll
+        for(int ks = 0; ks < KStages; ++ks) {
+            FragA a_frag[WaveTileM];
+            FragB b_frag[WaveTileN];
 
-        #pragma unroll
-        for(int i = 0; i < WaveTileM; ++i) {
-            const int a_row = (wave_row * WaveTileM + i) * FragM;
-            rocwmma::load_matrix_sync(
-                a_frag[i],
-                &a_tile[buf][a_row * kATileStride],
-                kATileStride);
-        }
-        #pragma unroll
-        for(int j = 0; j < WaveTileN; ++j) {
-            const int b_col = (wave_col * WaveTileN + j) * FragN;
-            rocwmma::load_matrix_sync(
-                b_frag[j],
-                &b_tile[buf][b_col * kBTileStride],
-                kBTileStride);
-        }
-        #pragma unroll
-        for(int i = 0; i < WaveTileM; ++i) {
+            #pragma unroll
+            for(int i = 0; i < WaveTileM; ++i) {
+                const int a_row = (wave_row * WaveTileM + i) * FragM;
+                rocwmma::load_matrix_sync(
+                    a_frag[i],
+                    &a_tile[buf][a_row * kATileStride + ks * FragK],
+                    kATileStride);
+            }
             #pragma unroll
             for(int j = 0; j < WaveTileN; ++j) {
-                rocwmma::mma_sync(accum[i][j], a_frag[i], b_frag[j], accum[i][j]);
+                const int b_col = (wave_col * WaveTileN + j) * FragN;
+                rocwmma::load_matrix_sync(
+                    b_frag[j],
+                    &b_tile[buf][b_col * kBTileStride + ks * FragK],
+                    kBTileStride);
+            }
+            #pragma unroll
+            for(int i = 0; i < WaveTileM; ++i) {
+                #pragma unroll
+                for(int j = 0; j < WaveTileN; ++j) {
+                    rocwmma::mma_sync(accum[i][j], a_frag[i], b_frag[j], accum[i][j]);
+                }
             }
         }
     };
