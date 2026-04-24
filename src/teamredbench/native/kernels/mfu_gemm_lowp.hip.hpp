@@ -8,15 +8,15 @@ template <>
 struct KernelTuning<rocwmma::float16_t> {
     static constexpr int kFragM = 16;
     static constexpr int kFragN = 16;
-    static constexpr int kFragK = 16;
+    static constexpr int kFragK = 32;
     static constexpr int kMfmaWaveGridM = 4;
     static constexpr int kMfmaWaveGridN = 2;
     static constexpr int kMfmaWaveTileM = 4;
     static constexpr int kMfmaWaveTileN = 4;
-    static constexpr int kMfmaKStages = 2;
-    static constexpr int kMfmaBlocksPerCu = 2;
+    static constexpr int kMfmaKStages = 1;
+    static constexpr int kMfmaBlocksPerCu = 3;
     static constexpr int kMfmaTileGroupM = 8;
-    static constexpr int kMfmaLdsPadA = 8;
+    static constexpr int kMfmaLdsPadA = 16;
     static constexpr int kMfmaLdsPadB = 0;
 };
 
@@ -24,15 +24,15 @@ template <>
 struct KernelTuning<rocwmma::bfloat16_t> {
     static constexpr int kFragM = 16;
     static constexpr int kFragN = 16;
-    static constexpr int kFragK = 16;
+    static constexpr int kFragK = 32;
     static constexpr int kMfmaWaveGridM = 2;
     static constexpr int kMfmaWaveGridN = 4;
     static constexpr int kMfmaWaveTileM = 4;
     static constexpr int kMfmaWaveTileN = 4;
-    static constexpr int kMfmaKStages = 2;
-    static constexpr int kMfmaBlocksPerCu = 2;
+    static constexpr int kMfmaKStages = 1;
+    static constexpr int kMfmaBlocksPerCu = 3;
     static constexpr int kMfmaTileGroupM = 8;
-    static constexpr int kMfmaLdsPadA = 8;
+    static constexpr int kMfmaLdsPadA = 16;
     static constexpr int kMfmaLdsPadB = 0;
 };
 
@@ -186,6 +186,20 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
         }
     };
 
+    // B uses wave-collective global_load_lds. Each wave issues 1024-byte loads
+    // that map 1:1 onto contiguous rows of the packed tile (requires LdsPadB=0
+    // and kBlockTileN chosen so (kBlockTileN * sizeof(T)) divides 64 * kVecBytes).
+    static_assert(LdsPadB == 0, "intrinsic B path requires LdsPadB=0 so rows are contiguous in LDS");
+    constexpr int kBytesPerPass = 64 * kVecBytes;
+    constexpr int kRowBytes = kBlockTileN * static_cast<int>(sizeof(T));
+    static_assert(kBytesPerPass % kRowBytes == 0, "kBlockTileN*sizeof(T) must divide 64*16");
+    constexpr int kRowsPerPass = kBytesPerPass / kRowBytes;
+    constexpr int kWavesPerBlock = kThreadsPerBlock / 64;
+    constexpr int kBTotalPasses = kBlockTileK / kRowsPerPass;
+    static_assert(kBlockTileK % kRowsPerPass == 0, "kBlockTileK must be a multiple of kRowsPerPass");
+    constexpr int kBPassesPerWave = kBTotalPasses / kWavesPerBlock;
+    constexpr int kBTailPasses = kBTotalPasses - kBPassesPerWave * kWavesPerBlock;
+
     auto vec_load_b = [&](int buf, int k_base, int col_base) {
         const int tile_col = col_base / kBlockTileN;
         const int tile_k = k_base / kBlockTileK;
@@ -193,16 +207,27 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
             (static_cast<std::size_t>(tile_k) * static_cast<std::size_t>(tiles_n) + static_cast<std::size_t>(tile_col))
             * packed_b_tile_elements<T>();
 
-        #pragma unroll 1
-        for(int vi = linear_tid; vi < kBTotalVecs; vi += kThreadsPerBlock) {
-            const int row_in_tile = vi / kBVecsPerRow;
-            const int vec_in_row = vi % kBVecsPerRow;
-            const uint4 v = *reinterpret_cast<const uint4*>(
-                b_packed + packed_tile_offset
-                    + static_cast<std::size_t>(row_in_tile) * static_cast<std::size_t>(kBTileStride)
-                    + static_cast<std::size_t>(vec_in_row * kVecElems));
-            *reinterpret_cast<uint4*>(
-                &b_tile[buf][row_in_tile * kBTileStride + vec_in_row * kVecElems]) = v;
+        const int lane = linear_tid & 63;
+        const int wave_id_local = linear_tid / 64;
+
+        #pragma unroll
+        for(int p = 0; p < kBPassesPerWave; ++p) {
+            const int row_in_tile = (wave_id_local * kBPassesPerWave + p) * kRowsPerPass;
+            const T* global_src = b_packed + packed_tile_offset
+                + static_cast<std::size_t>(row_in_tile) * static_cast<std::size_t>(kBlockTileN)
+                + static_cast<std::size_t>(lane) * static_cast<std::size_t>(kVecElems);
+            T* lds_dst = &b_tile[buf][row_in_tile * kBTileStride + lane * kVecElems];
+            global_load_vec16_to_lds(global_src, lds_dst);
+        }
+        if constexpr(kBTailPasses > 0) {
+            if(wave_id_local < kBTailPasses) {
+                const int row_in_tile = (kBPassesPerWave * kWavesPerBlock + wave_id_local) * kRowsPerPass;
+                const T* global_src = b_packed + packed_tile_offset
+                    + static_cast<std::size_t>(row_in_tile) * static_cast<std::size_t>(kBlockTileN)
+                    + static_cast<std::size_t>(lane) * static_cast<std::size_t>(kVecElems);
+                T* lds_dst = &b_tile[buf][row_in_tile * kBTileStride + lane * kVecElems];
+                global_load_vec16_to_lds(global_src, lds_dst);
+            }
         }
     };
 
