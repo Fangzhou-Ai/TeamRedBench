@@ -16,7 +16,7 @@ struct KernelTuning<rocwmma::float16_t> {
     static constexpr int kMfmaKStages = 1;
     static constexpr int kMfmaBlocksPerCu = 3;
     static constexpr int kMfmaTileGroupM = 8;
-    static constexpr int kMfmaLdsPadA = 16;
+    static constexpr int kMfmaLdsPadA = 0;
     static constexpr int kMfmaLdsPadB = 0;
 };
 
@@ -32,7 +32,7 @@ struct KernelTuning<rocwmma::bfloat16_t> {
     static constexpr int kMfmaKStages = 1;
     static constexpr int kMfmaBlocksPerCu = 3;
     static constexpr int kMfmaTileGroupM = 8;
-    static constexpr int kMfmaLdsPadA = 16;
+    static constexpr int kMfmaLdsPadA = 0;
     static constexpr int kMfmaLdsPadB = 0;
 };
 
@@ -157,8 +157,9 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
     static_assert((kBTileStride * static_cast<int>(sizeof(T))) % kVecBytes == 0,
                   "B LDS stride must keep 16-byte alignment");
 
-    __shared__ T a_tile[2][kBlockTileM * kATileStride];
-    __shared__ T b_tile[2][kBlockTileK * kBTileStride];
+    constexpr int kPipelineStages = 3;
+    __shared__ T a_tile[kPipelineStages][kBlockTileM * kATileStride];
+    __shared__ T b_tile[kPipelineStages][kBlockTileK * kBTileStride];
 
     const int linear_tid = static_cast<int>(threadIdx.x);
     const int wave_id = linear_tid / 64;
@@ -291,24 +292,35 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
             }
         }
 
-        int buf = 0;
-        vec_load_a(buf, 0, row_base);
-        vec_load_b(buf, 0, col_base);
+        // Triple-buffered pipeline: at steady state two tiles are in flight
+        // (one being issued, one sitting in LDS waiting) while the oldest
+        // buffer drives compute.
+        const int num_k_stages = k / kBlockTileK;
+
+        int load_stage = 0;
+        while(load_stage < kPipelineStages - 1 && load_stage < num_k_stages) {
+            vec_load_a(load_stage, load_stage * kBlockTileK, row_base);
+            vec_load_b(load_stage, load_stage * kBlockTileK, col_base);
+            ++load_stage;
+        }
         __syncthreads();
 
-        for(int k_base = 0; k_base + kBlockTileK < k; k_base += kBlockTileK) {
-            const int next_buf = buf ^ 1;
-            const int next_k_base = k_base + kBlockTileK;
-
-            vec_load_a(next_buf, next_k_base, row_base);
-            vec_load_b(next_buf, next_k_base, col_base);
-            compute_stage(buf, accum);
+        int compute_stage_idx = 0;
+        for(; compute_stage_idx + (kPipelineStages - 1) < num_k_stages; ++compute_stage_idx) {
+            const int load_buf = load_stage % kPipelineStages;
+            const int compute_buf = compute_stage_idx % kPipelineStages;
+            vec_load_a(load_buf, load_stage * kBlockTileK, row_base);
+            vec_load_b(load_buf, load_stage * kBlockTileK, col_base);
+            compute_stage(compute_buf, accum);
             __syncthreads();
-            buf = next_buf;
+            ++load_stage;
         }
 
-        compute_stage(buf, accum);
-        __syncthreads();
+        for(; compute_stage_idx < num_k_stages; ++compute_stage_idx) {
+            const int compute_buf = compute_stage_idx % kPipelineStages;
+            compute_stage(compute_buf, accum);
+            __syncthreads();
+        }
 
         #pragma unroll
         for(int i = 0; i < WaveTileM; ++i) {
