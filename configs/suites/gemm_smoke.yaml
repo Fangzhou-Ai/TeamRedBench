@@ -1,0 +1,28 @@
+name: gemm-smoke
+device:
+  profile: ../profiles/hardware/cdna_generic.yaml
+runtime:
+  profile: ../profiles/rocm/rocm_generic.yaml
+plugins: []
+outputs:
+  directory: ../../results/gemm_smoke
+  formats:
+    - json
+    - csv
+benchmarks:
+  - benchmark: mfu
+    metrics:
+      - achieved_tops
+      - mfu_pct
+      - latency_us
+    params:
+      backend: torch
+      dtypes:
+        - float16
+        - bfloat16
+        - float32
+        - float64
+      shapes:
+        - [4096, 4096, 4096]
+      warmup: 5
+      iterations: 20

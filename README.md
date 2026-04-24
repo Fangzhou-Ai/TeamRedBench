@@ -111,7 +111,7 @@ The `mfu` benchmark runs GEMM sweeps and compares achieved throughput against pe
 - `mfu_pct`
 - `latency_us`
 
-The default backend is `torch`. Set `params.backend: native` to run the built-in hipBLAS path instead.
+The default backend is `torch`. Set `params.backend: native` to run the built-in rocWMMA/MFMA GEMM kernel instead.
 Built-in native kernel name: `mfu_hipblas`.
 
 For integer and complex dtypes, the repo uses dtype-specific operation-count factors so MFU remains tied to the configured theoretical peak.
