@@ -9,13 +9,13 @@ struct KernelTuning<rocwmma::float16_t> {
     static constexpr int kFragM = 16;
     static constexpr int kFragN = 16;
     static constexpr int kFragK = 32;
-    static constexpr int kMfmaWaveGridM = 4;
-    static constexpr int kMfmaWaveGridN = 2;
+    static constexpr int kMfmaWaveGridM = 2;
+    static constexpr int kMfmaWaveGridN = 4;
     static constexpr int kMfmaWaveTileM = 4;
     static constexpr int kMfmaWaveTileN = 4;
     static constexpr int kMfmaKStages = 1;
-    static constexpr int kMfmaBlocksPerCu = 3;
-    static constexpr int kMfmaTileGroupM = 8;
+    static constexpr int kMfmaBlocksPerCu = 4;
+    static constexpr int kMfmaTileGroupM = 1;
     static constexpr int kMfmaLdsPadA = 0;
     static constexpr int kMfmaLdsPadB = 0;
 };
@@ -25,28 +25,27 @@ struct KernelTuning<rocwmma::bfloat16_t> {
     static constexpr int kFragM = 16;
     static constexpr int kFragN = 16;
     static constexpr int kFragK = 32;
-    static constexpr int kMfmaWaveGridM = 4;
-    static constexpr int kMfmaWaveGridN = 2;
+    static constexpr int kMfmaWaveGridM = 2;
+    static constexpr int kMfmaWaveGridN = 4;
     static constexpr int kMfmaWaveTileM = 4;
     static constexpr int kMfmaWaveTileN = 4;
     static constexpr int kMfmaKStages = 1;
-    static constexpr int kMfmaBlocksPerCu = 3;
-    static constexpr int kMfmaTileGroupM = 8;
+    static constexpr int kMfmaBlocksPerCu = 4;
+    static constexpr int kMfmaTileGroupM = 2;
     static constexpr int kMfmaLdsPadA = 0;
     static constexpr int kMfmaLdsPadB = 0;
 };
 
-// Row-stride (along N) of a packed B tile. Tiles are stored row-major so that
-// rocWMMA's row_major matrix_b fragments read them cleanly; the original
-// col_major layout hit a correctness bug in rocWMMA's 16x16x32 fp16/bf16 path.
+// K stride of a packed B tile column. Packing B with K contiguous per N column
+// lets the raw MFMA path load each B operand vector with one 16-byte LDS read.
 template <typename T>
 constexpr int packed_b_tile_stride() {
-    return mfma_block_tile_n<T>() + KernelTuning<T>::kMfmaLdsPadB;
+    return mfma_block_tile_k<T>() + KernelTuning<T>::kMfmaLdsPadB;
 }
 
 template <typename T>
 constexpr std::size_t packed_b_tile_elements() {
-    return static_cast<std::size_t>(mfma_block_tile_k<T>()) * static_cast<std::size_t>(packed_b_tile_stride<T>());
+    return static_cast<std::size_t>(mfma_block_tile_n<T>()) * static_cast<std::size_t>(packed_b_tile_stride<T>());
 }
 
 template <typename T>
@@ -56,9 +55,30 @@ __device__ __forceinline__ void global_load_vec16_to_lds(const T* src, T* dst) {
     __builtin_amdgcn_global_load_lds(global_ptr, lds_ptr, 16u, 0, 0u);
 }
 
-// Pack B once into tile-local row-major blocks so the timed kernel can use
-// contiguous global_load_lds transfers and a row_major matrix_b fragment load
-// without paying the gather/stride cost every iteration.
+using MfmaInputVec4 = uint32_t __attribute__((ext_vector_type(4)));
+using MfmaAccumVec4 = float __attribute__((ext_vector_type(4)));
+
+template <typename T>
+__device__ __forceinline__ MfmaAccumVec4 mfma_16x16x32(MfmaInputVec4 a, MfmaInputVec4 b, MfmaAccumVec4 c);
+
+template <>
+__device__ __forceinline__ MfmaAccumVec4 mfma_16x16x32<rocwmma::float16_t>(
+    MfmaInputVec4 a,
+    MfmaInputVec4 b,
+    MfmaAccumVec4 c) {
+    return __builtin_amdgcn_mfma_f32_16x16x32_f16(a, b, c, 0, 0, 0);
+}
+
+template <>
+__device__ __forceinline__ MfmaAccumVec4 mfma_16x16x32<rocwmma::bfloat16_t>(
+    MfmaInputVec4 a,
+    MfmaInputVec4 b,
+    MfmaAccumVec4 c) {
+    return __builtin_amdgcn_mfma_f32_16x16x32_bf16(a, b, c, 0, 0, 0);
+}
+
+// Pack B once into tile-local K-contiguous columns so the timed kernel avoids
+// strided B operand gathers in the hot MFMA loop.
 template <
     typename T,
     int FragM = KernelTuning<T>::kFragM,
@@ -75,13 +95,13 @@ __global__ void pack_b_tiles_kernel(const T* __restrict__ b, T* __restrict__ b_p
     constexpr int kBlockTileK = FragK * KStages;
     constexpr int kVecBytes = 16;
     constexpr int kVecElems = kVecBytes / static_cast<int>(sizeof(T));
-    constexpr int kPackedStride = kBlockTileN + LdsPadB;
-    constexpr int kVecsPerRow = kBlockTileN / kVecElems;
-    constexpr int kTotalVecs = kBlockTileK * kVecsPerRow;
+    constexpr int kPackedStride = kBlockTileK + LdsPadB;
+    constexpr int kVecsPerCol = kBlockTileK / kVecElems;
+    constexpr int kTotalVecs = kBlockTileN * kVecsPerCol;
 
     static_assert((kPackedStride * static_cast<int>(sizeof(T))) % kVecBytes == 0,
                   "Packed B stride must keep 16-byte alignment");
-    static_assert(kBlockTileN % kVecElems == 0, "BlockTileN must be divisible by vector elements");
+    static_assert(kBlockTileK % kVecElems == 0, "BlockTileK must be divisible by vector elements");
 
     const int tiles_n = n / kBlockTileN;
     const int tiles_k = k / kBlockTileK;
@@ -98,15 +118,16 @@ __global__ void pack_b_tiles_kernel(const T* __restrict__ b, T* __restrict__ b_p
     const std::size_t packed_tile_offset = static_cast<std::size_t>(tile_id) * packed_b_tile_elements<T>();
 
     for(int vi = static_cast<int>(threadIdx.x); vi < kTotalVecs; vi += static_cast<int>(blockDim.x)) {
-        const int row_in_tile = vi / kVecsPerRow;
-        const int vec_in_row = vi % kVecsPerRow;
-        const uint4 v = *reinterpret_cast<const uint4*>(
-            b + static_cast<std::size_t>(k_base + row_in_tile) * static_cast<std::size_t>(n)
-              + static_cast<std::size_t>(n_base + vec_in_row * kVecElems));
-        *reinterpret_cast<uint4*>(
-            &b_packed[packed_tile_offset
-                      + static_cast<std::size_t>(row_in_tile) * static_cast<std::size_t>(kPackedStride)
-                      + static_cast<std::size_t>(vec_in_row * kVecElems)]) = v;
+        const int col_in_tile = vi / kVecsPerCol;
+        const int vec_in_col = vi % kVecsPerCol;
+        #pragma unroll
+        for(int e = 0; e < kVecElems; ++e) {
+            b_packed[packed_tile_offset
+                     + static_cast<std::size_t>(col_in_tile) * static_cast<std::size_t>(kPackedStride)
+                     + static_cast<std::size_t>(vec_in_col * kVecElems + e)] =
+                b[static_cast<std::size_t>(k_base + vec_in_col * kVecElems + e) * static_cast<std::size_t>(n)
+                  + static_cast<std::size_t>(n_base + col_in_tile)];
+        }
     }
 }
 
@@ -132,11 +153,8 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
     int k) {
     static_assert(std::is_same_v<T, rocwmma::float16_t> || std::is_same_v<T, rocwmma::bfloat16_t>,
                   "Low-precision kernel only supports fp16 and bf16");
-    using Acc = AccumT<T>;
-    using FragA = rocwmma::fragment<rocwmma::matrix_a, FragM, FragN, FragK, T, rocwmma::row_major>;
-    using FragB = rocwmma::fragment<rocwmma::matrix_b, FragM, FragN, FragK, T, rocwmma::row_major>;
-    using FragC = rocwmma::fragment<rocwmma::accumulator, FragM, FragN, FragK, Acc>;
-    using FragOut = rocwmma::fragment<rocwmma::accumulator, FragM, FragN, FragK, T, rocwmma::row_major>;
+    static_assert(FragM == 16 && FragN == 16 && FragK == 32,
+                  "Raw low-precision MFMA path expects 16x16x32 fragments");
 
     constexpr int kThreadsPerBlock = 64 * WaveGridM * WaveGridN;
     constexpr int kBlockTileM = FragM * WaveGridM * WaveTileM;
@@ -146,9 +164,8 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
     constexpr int kVecBytes = 16;
     constexpr int kVecElems = kVecBytes / static_cast<int>(sizeof(T));
     constexpr int kATileStride = kBlockTileK + LdsPadA;
-    constexpr int kBTileStride = kBlockTileN + LdsPadB;
+    constexpr int kBTileStride = kBlockTileK + LdsPadB;
     constexpr int kWavesPerBlock = kThreadsPerBlock / 64;
-    constexpr int kBytesPerPass = 64 * kVecBytes;
 
     static_assert(kBlockTileK % kVecElems == 0, "BlockTileK must be divisible by vector elements");
     static_assert(kBlockTileN % kVecElems == 0, "BlockTileN must be divisible by vector elements");
@@ -157,9 +174,9 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
     static_assert((kBTileStride * static_cast<int>(sizeof(T))) % kVecBytes == 0,
                   "B LDS stride must keep 16-byte alignment");
 
-    constexpr int kPipelineStages = 3;
+    constexpr int kPipelineStages = 2;
     __shared__ T a_tile[kPipelineStages][kBlockTileM * kATileStride];
-    __shared__ T b_tile[kPipelineStages][kBlockTileK * kBTileStride];
+    __shared__ T b_tile[kPipelineStages][kBlockTileN * kBTileStride];
 
     const int linear_tid = static_cast<int>(threadIdx.x);
     const int wave_id = linear_tid / 64;
@@ -170,11 +187,14 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
     const int tiles_n = n / kBlockTileN;
     const int total_tiles = tiles_m * tiles_n;
 
-    // A keeps padded LDS (LdsPadA > 0) to avoid bank conflicts during the MFMA
-    // load_matrix_sync reads, so it cannot use the wave-uniform-LDS intrinsic
-    // path used for B. Plain uint4 loads are fast enough given the padded layout.
+    // A is strided in global memory, so each thread issues its own direct
+    // global-to-LDS transfer. Packed B is contiguous and can use wave-coalesced
+    // direct-to-LDS transfers below.
     constexpr int kAVecsPerRow = kBlockTileK / kVecElems;
     constexpr int kATotalVecs = kBlockTileM * kAVecsPerRow;
+
+    constexpr int kBVecsPerCol = kBlockTileK / kVecElems;
+    constexpr int kBTotalVecs = kBlockTileN * kBVecsPerCol;
 
     auto vec_load_a = [&](int buf, int k_base, int row_base) {
         #pragma unroll 1
@@ -183,25 +203,12 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
             const int vec_in_row = vi % kAVecsPerRow;
             const int global_row = row_base + row_in_tile;
             const int global_k = k_base + vec_in_row * kVecElems;
-            const uint4 v = *reinterpret_cast<const uint4*>(
-                a + static_cast<std::size_t>(global_row) * static_cast<std::size_t>(k)
-                  + static_cast<std::size_t>(global_k));
-            *reinterpret_cast<uint4*>(
-                &a_tile[buf][row_in_tile * kATileStride + vec_in_row * kVecElems]) = v;
+            const T* global_src = a + static_cast<std::size_t>(global_row) * static_cast<std::size_t>(k)
+                + static_cast<std::size_t>(global_k);
+            T* lds_dst = &a_tile[buf][row_in_tile * kATileStride + vec_in_row * kVecElems];
+            global_load_vec16_to_lds(global_src, lds_dst);
         }
     };
-
-    // B uses wave-collective global_load_lds. Each wave issues 1024-byte loads
-    // that map 1:1 onto contiguous rows of the packed tile (requires LdsPadB=0
-    // and kBlockTileN chosen so (kBlockTileN * sizeof(T)) divides 64 * kVecBytes).
-    static_assert(LdsPadB == 0, "intrinsic B path requires LdsPadB=0 so rows are contiguous in LDS");
-    constexpr int kBRowBytes = kBlockTileN * static_cast<int>(sizeof(T));
-    static_assert(kBytesPerPass % kBRowBytes == 0, "kBlockTileN*sizeof(T) must divide 64*16");
-    constexpr int kBRowsPerPass = kBytesPerPass / kBRowBytes;
-    constexpr int kBTotalPasses = kBlockTileK / kBRowsPerPass;
-    static_assert(kBlockTileK % kBRowsPerPass == 0, "kBlockTileK must be a multiple of kBRowsPerPass");
-    constexpr int kBPassesPerWave = kBTotalPasses / kWavesPerBlock;
-    constexpr int kBTailPasses = kBTotalPasses - kBPassesPerWave * kWavesPerBlock;
 
     auto vec_load_b = [&](int buf, int k_base, int col_base) {
         const int tile_col = col_base / kBlockTileN;
@@ -210,67 +217,53 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
             (static_cast<std::size_t>(tile_k) * static_cast<std::size_t>(tiles_n) + static_cast<std::size_t>(tile_col))
             * packed_b_tile_elements<T>();
 
-        const int lane = linear_tid & 63;
-        const int wave_id_local = linear_tid / 64;
-
-        #pragma unroll
-        for(int p = 0; p < kBPassesPerWave; ++p) {
-            const int row_in_tile = (wave_id_local * kBPassesPerWave + p) * kBRowsPerPass;
+        #pragma unroll 1
+        for(int vi = linear_tid; vi < kBTotalVecs; vi += kThreadsPerBlock) {
+            const int col_in_tile = vi / kBVecsPerCol;
+            const int vec_in_col = vi % kBVecsPerCol;
             const T* global_src = b_packed + packed_tile_offset
-                + static_cast<std::size_t>(row_in_tile) * static_cast<std::size_t>(kBlockTileN)
-                + static_cast<std::size_t>(lane) * static_cast<std::size_t>(kVecElems);
-            T* lds_dst = &b_tile[buf][row_in_tile * kBTileStride + lane * kVecElems];
+                + static_cast<std::size_t>(col_in_tile) * static_cast<std::size_t>(kBTileStride)
+                + static_cast<std::size_t>(vec_in_col * kVecElems);
+            T* lds_dst = &b_tile[buf][col_in_tile * kBTileStride + vec_in_col * kVecElems];
             global_load_vec16_to_lds(global_src, lds_dst);
-        }
-        if constexpr(kBTailPasses > 0) {
-            if(wave_id_local < kBTailPasses) {
-                const int row_in_tile = (kBPassesPerWave * kWavesPerBlock + wave_id_local) * kBRowsPerPass;
-                const T* global_src = b_packed + packed_tile_offset
-                    + static_cast<std::size_t>(row_in_tile) * static_cast<std::size_t>(kBlockTileN)
-                    + static_cast<std::size_t>(lane) * static_cast<std::size_t>(kVecElems);
-                T* lds_dst = &b_tile[buf][row_in_tile * kBTileStride + lane * kVecElems];
-                global_load_vec16_to_lds(global_src, lds_dst);
-            }
         }
     };
 
-    auto compute_stage = [&](int buf, FragC accum[WaveTileM][WaveTileN]) {
+    auto compute_stage = [&](int buf, MfmaAccumVec4 accum[WaveTileM][WaveTileN]) {
+        const int lane = linear_tid & 63;
+        const int a_lane_m = lane & 15;
+        const int a_lane_k = lane >> 4;
+        const int b_lane_n = lane & 15;
+        const int b_lane_k = lane >> 4;
+
         #pragma unroll
         for(int ks = 0; ks < KStages; ++ks) {
-            FragA a_frag[WaveTileM];
-            FragB b_frag[WaveTileN];
+            MfmaInputVec4 a_frag[WaveTileM];
+            MfmaInputVec4 b_frag[WaveTileN];
 
             #pragma unroll
             for(int i = 0; i < WaveTileM; ++i) {
                 const int a_row = (wave_row * WaveTileM + i) * FragM;
-                rocwmma::load_matrix_sync(
-                    a_frag[i],
-                    &a_tile[buf][a_row * kATileStride + ks * FragK],
-                    kATileStride);
+                a_frag[i] = *reinterpret_cast<const MfmaInputVec4*>(
+                    &a_tile[buf][(a_row + a_lane_m) * kATileStride + ks * FragK + a_lane_k * 8]);
             }
             #pragma unroll
             for(int j = 0; j < WaveTileN; ++j) {
                 const int b_col = (wave_col * WaveTileN + j) * FragN;
-                rocwmma::load_matrix_sync(
-                    b_frag[j],
-                    &b_tile[buf][ks * FragK * kBTileStride + b_col],
-                    kBTileStride);
+                b_frag[j] = *reinterpret_cast<const MfmaInputVec4*>(
+                    &b_tile[buf][(b_col + b_lane_n) * kBTileStride + ks * FragK + b_lane_k * 8]);
             }
             #pragma unroll
             for(int i = 0; i < WaveTileM; ++i) {
                 #pragma unroll
                 for(int j = 0; j < WaveTileN; ++j) {
-                    rocwmma::mma_sync(accum[i][j], a_frag[i], b_frag[j], accum[i][j]);
+                    accum[i][j] = mfma_16x16x32<T>(a_frag[i], b_frag[j], accum[i][j]);
                 }
             }
         }
     };
 
     for(int tile_linear = static_cast<int>(blockIdx.x); tile_linear < total_tiles; tile_linear += static_cast<int>(gridDim.x)) {
-        // Let the backend interleave LDS reads and MFMA issue more aggressively
-        // in the hot GEMM loop.
-        __builtin_amdgcn_iglp_opt(0);
-
         const int group_stride = TileGroupM * tiles_n;
         const int group_id = tile_linear / group_stride;
         const int first_tile_m = group_id * TileGroupM;
@@ -283,18 +276,16 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
         const int row_base = tile_row * kBlockTileM;
         const int col_base = tile_col * kBlockTileN;
 
-        FragC accum[WaveTileM][WaveTileN];
+        MfmaAccumVec4 accum[WaveTileM][WaveTileN];
         #pragma unroll
         for(int i = 0; i < WaveTileM; ++i) {
             #pragma unroll
             for(int j = 0; j < WaveTileN; ++j) {
-                rocwmma::fill_fragment(accum[i][j], static_cast<Acc>(0));
+                accum[i][j] = {0.0f, 0.0f, 0.0f, 0.0f};
             }
         }
 
-        // Triple-buffered pipeline: at steady state two tiles are in flight
-        // (one being issued, one sitting in LDS waiting) while the oldest
-        // buffer drives compute.
+        // Pipeline global-to-LDS staging ahead of the MFMA loop.
         const int num_k_stages = k / kBlockTileK;
 
         int load_stage = 0;
@@ -322,20 +313,21 @@ __global__ __launch_bounds__(64 * WaveGridM * WaveGridN, KernelTuning<T>::kMfmaB
             __syncthreads();
         }
 
+        const int c_lane_m = ((linear_tid >> 4) & 3) * 4;
+        const int c_lane_n = linear_tid & 15;
+
         #pragma unroll
         for(int i = 0; i < WaveTileM; ++i) {
             const int global_row = row_base + (wave_row * WaveTileM + i) * FragM;
             #pragma unroll
             for(int j = 0; j < WaveTileN; ++j) {
                 const int global_col = col_base + (wave_col * WaveTileN + j) * FragN;
-                T* out_ptr = &c[static_cast<std::size_t>(global_row) * static_cast<std::size_t>(n)
-                                + static_cast<std::size_t>(global_col)];
-                FragOut out_frag;
                 #pragma unroll
-                for(int element = 0; element < out_frag.num_elements; ++element) {
-                    out_frag.x[element] = cast_output<T>(accum[i][j].x[element]);
+                for(int element = 0; element < 4; ++element) {
+                    c[static_cast<std::size_t>(global_row + c_lane_m + element) * static_cast<std::size_t>(n)
+                      + static_cast<std::size_t>(global_col + c_lane_n)] =
+                        cast_output<T>(accum[i][j][element]);
                 }
-                rocwmma::store_matrix_sync(out_ptr, out_frag, n);
             }
         }
     }
@@ -437,7 +429,18 @@ inline double run_low_precision_kernel(const Args& args, int* active_blocks_per_
                 props.multiProcessorCount * std::max(1, resolve_mfma_blocks_per_cu<T>(args))
             )
         );
-        hipLaunchKernelGGL(mfma_gemm_lowp_kernel<T>, dim3(blocks), dim3(mfma_threads_per_block<T>()), 0, stream, a, b_packed, c, args.m, args.n, args.k);
+        hipLaunchKernelGGL(
+            mfma_gemm_lowp_kernel<T>,
+            dim3(blocks),
+            dim3(mfma_threads_per_block<T>()),
+            0,
+            stream,
+            a,
+            b_packed,
+            c,
+            args.m,
+            args.n,
+            args.k);
         check_hip(hipGetLastError(), "mfma_gemm_lowp_kernel");
     };
 
@@ -487,7 +490,7 @@ inline int emit_low_precision_success(const Args& args) {
     int active_blocks_per_cu = 0;
     const double elapsed_s = run_low_precision_kernel<T>(args, &active_blocks_per_cu);
     std::cout << "{\"status\":\"ok\",\"raw_metrics\":{\"elapsed_s\":" << elapsed_s
-              << "},\"metadata\":{\"implementation\":\"rocwmma_mfma_packed_b\""
+              << "},\"metadata\":{\"implementation\":\"raw_mfma_col_packed_b\""
               << ",\"threads_per_block\":" << mfma_threads_per_block<T>()
               << ",\"tile_m\":" << mfma_block_tile_m<T>()
               << ",\"tile_n\":" << mfma_block_tile_n<T>()
